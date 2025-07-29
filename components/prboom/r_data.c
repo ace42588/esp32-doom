@@ -224,7 +224,7 @@ static void R_InitTextures (void)
       texture->height = SHORT(mtexture->height);
       texture->patchcount = SHORT(mtexture->patchcount);
 
-        /* Mattias Engdegård emailed me of the following explenation of
+        /* Mattias Engdegï¿½rd emailed me of the following explenation of
          * why memcpy doesnt work on some systems:
          * "I suppose it is the mad unaligned allocation
          * going on (and which gcc in some way manages to cope with
@@ -375,13 +375,22 @@ static void R_InitSpriteLumps(void)
 static void R_InitColormaps(void)
 {
   int i;
-  firstcolormaplump = W_GetNumForName("C_START");
-  lastcolormaplump  = W_GetNumForName("C_END");
-  numcolormaps = lastcolormaplump - firstcolormaplump;
-  colormaps = Z_Malloc(sizeof(*colormaps) * numcolormaps, PU_STATIC, 0);
-  colormaps[0] = (const lighttable_t *)W_CacheLumpName("COLORMAP");
-  for (i=1; i<numcolormaps; i++)
-    colormaps[i] = (const lighttable_t *)W_CacheLumpNum(i+firstcolormaplump);
+  firstcolormaplump = W_CheckNumForName("C_START");
+  lastcolormaplump  = W_CheckNumForName("C_END");
+  
+  if (firstcolormaplump == -1 || lastcolormaplump == -1) {
+    // C_START/C_END markers not found, use default colormap only
+    lprintf(LO_WARN, "R_InitColormaps: C_START/C_END markers not found, using default colormap\n");
+    numcolormaps = 1;
+    colormaps = Z_Malloc(sizeof(*colormaps) * numcolormaps, PU_STATIC, 0);
+    colormaps[0] = (const lighttable_t *)W_CacheLumpName("COLORMAP");
+  } else {
+    numcolormaps = lastcolormaplump - firstcolormaplump;
+    colormaps = Z_Malloc(sizeof(*colormaps) * numcolormaps, PU_STATIC, 0);
+    colormaps[0] = (const lighttable_t *)W_CacheLumpName("COLORMAP");
+    for (i=1; i<numcolormaps; i++)
+      colormaps[i] = (const lighttable_t *)W_CacheLumpNum(i+firstcolormaplump);
+  }
   // cph - always lock
 }
 
@@ -736,11 +745,23 @@ void R_PrecacheLevel(void)
 // Proff - Added for OpenGL
 void R_SetPatchNum(patchnum_t *patchnum, const char *name)
 {
+  int lump = W_CheckNumForName(name);
+  if (lump == -1) {
+    // Patch not found, use default values
+    lprintf(LO_WARN, "R_SetPatchNum: patch %s not found, using default\n", name);
+    patchnum->width = 0;
+    patchnum->height = 0;
+    patchnum->leftoffset = 0;
+    patchnum->topoffset = 0;
+    patchnum->lumpnum = -1;
+    return;
+  }
+  
   const rpatch_t *patch = R_CachePatchName(name);
   patchnum->width = patch->width;
   patchnum->height = patch->height;
   patchnum->leftoffset = patch->leftoffset;
   patchnum->topoffset = patch->topoffset;
-  patchnum->lumpnum = W_GetNumForName(name);
+  patchnum->lumpnum = lump;
   R_UnlockPatchName(name);
 }

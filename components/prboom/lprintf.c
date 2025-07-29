@@ -55,6 +55,7 @@
 #include "m_argv.h"
 
 #include "rom/ets_sys.h"
+#include "esp_log.h"
 
 int cons_error_mask = -1-LO_INFO; /* all but LO_INFO when redir'd */
 int cons_output_mask = -1;        /* all output enabled */
@@ -70,8 +71,12 @@ int cons_output_mask = -1;        /* all output enabled */
 int lprintf(OutputLevels pri, const char *s, ...) {
   va_list v;
   va_start(v,s);
-  vprintf(s,v);
+  // Use a buffer to avoid thread-safety issues with vprintf
+  char msg[MAX_MESSAGE_SIZE];
+  vsnprintf(msg, sizeof(msg), s, v);
   va_end(v);
+  // Use ESP-IDF's proper logging function
+  ESP_LOGI("DOOM", "%s", msg);
   return 0;
 }
 #endif

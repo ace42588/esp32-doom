@@ -201,7 +201,4 @@ void V_AllocScreens();
 void V_FreeScreen(screeninfo_t *scrn);
 void V_FreeScreens();
 
-#ifdef GL_DOOM
-#include "gl_struct.h"
-#endif
 #endif

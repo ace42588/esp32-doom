@@ -2892,40 +2892,7 @@ setup_menu_t gen_settings1[] = { // General Settings screen1
   {"Uncapped Framerate", S_YESNO, m_null, G_X,
   G_YA + general_uncapped*8, {"uncapped_framerate"}},
 
-#ifdef GL_DOOM
-  {"OpenGL", S_SKIP|S_TITLE, m_null, G_X, G_YA2 - 12},
-
-  {"Texture filter", S_CHOICE|S_PRGWARN, m_null, G_X,
-   G_YA2 + general_gl_texfilter*8, {"gl_tex_filter_string"}, 0, 0, NULL, gltexfilters},
-
-  {"Texture format", S_CHOICE|S_PRGWARN, m_null, G_X,
-   G_YA2 + general_gl_texformat*8, {"gl_tex_format_string"}, 0, 0, NULL, gltexformats},
-
-  {"Item out of Floor offset", S_NUM, m_null, G_X,
-   G_YA2 + general_flooroffset*8, {"gl_sprite_offset"}},
-#endif
-
-#if 0
-  {"PCX instead of BMP for screenshots", S_YESNO, m_null, G_X,
-   G_YA + general_pcx*8, {"screenshot_pcx"}},
-#endif
-
-#if 0 // MBF
-  {"Flash Icon During Disk IO", S_YESNO, m_null, G_X,
-   G_YA + general_diskicon*8, {"disk_icon"}},
-#endif
-
   {"Sound & Music", S_SKIP|S_TITLE, m_null, G_X, G_YA3 - 12},
-#if 0 // MBF
-  {"Sound Card", S_NUM|S_PRGWARN, m_null, G_X,
-   G_YA2 + general_sndcard*8, {"sound_card"}},
-
-  {"Music Card", S_NUM|S_PRGWARN, m_null, G_X,
-   G_YA2 + general_muscard*8, {"music_card"}},
-
-  {"Autodetect Number of Voices", S_YESNO|S_PRGWARN, m_null, G_X,
-   G_YA2 + general_detvoices*8, {"detect_voices"}},
-#endif
 
   {"Number of Sound Channels", S_NUM|S_PRGWARN, m_null, G_X,
    G_YA3 + general_sndchan*8, {"snd_channels"}},

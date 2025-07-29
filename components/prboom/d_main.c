@@ -80,8 +80,9 @@
 #include "r_fps.h"
 #include "d_main.h"
 #include "d_deh.h"  // Ty 04/08/98 - Externalizations
-#include "lprintf.h"  // jff 08/03/98 - declaration of lprintf
+#include "lprintf.h" // jff 08/03/98 - declaration of lprintf
 #include "am_map.h"
+#include "esp_task_wdt.h"
 
 void GetFirstMap(int *ep, int *map); // Ty 08/29/98 - add "-warp x" functionality
 static void D_PageDrawer(void);
@@ -204,6 +205,7 @@ extern int     showMessages;
 
 void D_Display (void)
 {
+  
   static boolean inhelpscreensstate   = false;
   static boolean isborderstate        = false;
   static boolean borderwillneedredraw = false;
@@ -273,8 +275,9 @@ void D_Display (void)
       R_DrawViewBorder();
 
     // Now do the drawing
-    if (viewactive)
+    if (viewactive) {
       R_RenderPlayerView (&players[displayplayer]);
+    }
     if (automapmode & am_active)
       AM_Drawer();
     ST_Drawer((viewheight != SCREENHEIGHT) || ((automapmode & am_active) && !(automapmode & am_overlay)), redrawborderstuff);
@@ -342,6 +345,12 @@ static void D_DoomLoop(void)
       WasRenderedInTryRunTics = false;
       // frame syncronous IO operations
       I_StartFrame ();
+      
+      // Reset watchdog timer to prevent timeouts
+      // Note: Only call if task is registered with watchdog
+      if (esp_task_wdt_status(NULL) == ESP_OK) {
+        esp_task_wdt_reset();
+      }
 
       if (ffmap == gamemap) ffmap = 0;
 
@@ -379,6 +388,7 @@ static void D_DoomLoop(void)
   auto_shot_count = auto_shot_time;
   M_DoScreenShot(auto_shot_fname);
       }
+      
     }
 }
 
@@ -636,10 +646,7 @@ static void CheckIWAD(const char *iwadname,GameMode_t *gmode,boolean *hassec)
         header.infotableofs = LONG(header.infotableofs);
         length = header.numlumps;
         fileinfo = malloc(length*sizeof(filelump_t));
-//        if (fseek (fp, header.infotableofs, SEEK_SET) ||
-//            fread (fileinfo, sizeof(filelump_t), length, fp) != length ||
-//            fclose(fp))
-//          I_Error("CheckIWAD: failed to read directory %s",iwadname);
+
 		I_Lseek(fd, header.infotableofs, SEEK_SET);
 		I_Read(fd, fileinfo, sizeof(filelump_t)*length);
 
@@ -1115,7 +1122,7 @@ static void DoLooseFiles(void)
 }
 
 /* cph - MBF-like wad/deh/bex autoload code */
-const char *wad_files[MAXLOADFILES], *deh_files[MAXLOADFILES];
+const char *wad_files[MAXLOADFILES] = {NULL}, *deh_files[MAXLOADFILES] = {NULL};
 
 // CPhipps - misc screen stuff
 unsigned int desired_screenwidth, desired_screenheight;
@@ -1399,11 +1406,6 @@ static void D_DoomMainSetup(void)
     }
 //    I_CalculateRes(w, h);
   }
-
-#ifdef GL_DOOM
-  // proff 04/05/2000: for GL-specific switches
-  gld_InitCommandLine();
-#endif
 
   //jff 9/3/98 use logical output routine
   lprintf(LO_INFO,"V_Init: allocate screens.\n");

@@ -1527,11 +1527,6 @@ void P_SetupLevel(int episode, int map, int playermask, skill_t skill)
     rejectlump = -1;
   }
 
-#ifdef GL_DOOM
-// proff 11/99: clean the memory from textures etc.
-  gld_CleanMemory();
-#endif
-
   P_InitThinkers();
 
   // if working with a devlopment map, reload it
@@ -1665,14 +1660,6 @@ void P_SetupLevel(int episode, int map, int playermask, skill_t skill)
   // preload graphics
   if (precache)
     R_PrecacheLevel();
-
-#ifdef GL_DOOM
-  if (V_GetMode() == VID_MODEGL)
-  {
-    // proff 11/99: calculate all OpenGL specific tables etc.
-    gld_PreprocessLevel();
-  }
-#endif
 
   R_SmoothPlaying_Reset(NULL); // e6y
 }

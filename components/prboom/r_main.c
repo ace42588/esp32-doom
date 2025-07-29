@@ -189,9 +189,6 @@ angle_t R_PointToAngle(fixed_t x, fixed_t y)
 
   if ( /* !render_precise && */
       // e6y: here is where "slime trails" can SOMETIMES occur
-#ifdef GL_DOOM
-      (V_GetMode() != VID_MODEGL) &&
-#endif
       (x < INT_MAX/4 && x > -INT_MAX/4 && y < INT_MAX/4 && y > -INT_MAX/4)
      )
   {
@@ -588,12 +585,7 @@ void R_RenderPlayerView (player_t* player)
   rendered_segs = rendered_visplanes = 0;
   if (V_GetMode() == VID_MODEGL)
   {
-#ifdef GL_DOOM
-    // proff 11/99: clear buffers
-    gld_InitDrawScene();
-    // proff 11/99: switch to perspective mode
-    gld_StartDrawScene();
-#endif
+
   } else {
     if (autodetect_hom)
     { // killough 2/10/98: add flashing red HOM indicators
@@ -608,8 +600,10 @@ void R_RenderPlayerView (player_t* player)
   NetUpdate ();
 #endif
 
-  // The head node is the last node output.
-  R_RenderBSPNode (numnodes-1);
+      // The head node is the last node output.
+    {
+    R_RenderBSPNode (numnodes-1);
+  }
   R_ResetColumnBuffer();
 
   // Check for new console commands.
@@ -625,8 +619,10 @@ void R_RenderPlayerView (player_t* player)
   NetUpdate ();
 #endif
 
-  if (V_GetMode() != VID_MODEGL) {
-    R_DrawMasked ();
+      if (V_GetMode() != VID_MODEGL) {
+      {
+      R_DrawMasked ();
+    }
     R_ResetColumnBuffer();
   }
 
@@ -636,12 +632,7 @@ void R_RenderPlayerView (player_t* player)
 #endif
 
   if (V_GetMode() == VID_MODEGL) {
-#ifdef GL_DOOM
-    // proff 11/99: draw the scene
-    gld_DrawScene(player);
-    // proff 11/99: finishing off
-    gld_EndDrawScene();
-#endif
+
   }
 
   if (rendering_stats) R_ShowStats();

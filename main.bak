@@ -1,0 +1,1360 @@
+/*
+ * ESP32 Doom WebSocket Server
+ *
+ * This file implements a WebSocket server that streams Doom game frames
+ * to connected web clients. It combines ESP32 networking capabilities
+ * with the PrBoom Doom engine.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h> 
+#include <stdbool.h>
+#include <sys/stat.h>
+
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "esp_spiffs.h"
+#include "esp_task_wdt.h"
+
+// FreeRTOS includes
+#include "freertos/semphr.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include <sys/socket.h>
+#include <sys/time.h>
+
+#include "protocol_examples_common.h"
+#include "i_system.h"
+#include "ws_doom_server.h"
+#include "simple_profiler.h"
+#include "PERFORMANCE_CONFIG.h"
+
+#include "esp_heap_caps.h"
+
+/* ============================================================================
+ * FUNCTION DECLARATIONS
+ * ============================================================================ */
+
+static esp_err_t init_delta_encoding_buffers(void);
+static void cleanup_delta_encoding_buffers(void);
+static size_t create_optimized_delta_frame(const uint8_t *current, size_t len, uint8_t *delta_buffer);
+static void network_transmission_task(void *pvParameters);
+static esp_err_t init_async_network_transmission(void);
+static void cleanup_async_network_transmission(void);
+static esp_err_t optimize_websocket_transmission(httpd_handle_t server_handle, int client_fd);
+static esp_err_t send_optimized_websocket_frame(httpd_handle_t server_handle, int client_fd, httpd_ws_frame_t *ws_pkt);
+static esp_err_t send_chunked_websocket_frame(httpd_handle_t server_handle, int client_fd, const uint8_t *data, size_t total_len, uint8_t palette_index);
+
+/**
+ * @brief RLE compress delta frame data
+ * @param delta_data Input delta data
+ * @param delta_size Input delta size
+ * @param compressed_buffer Output buffer for compressed data
+ * @return Size of compressed data
+ */
+static size_t compress_delta_rle(const uint8_t *delta_data, size_t delta_size, uint8_t *compressed_buffer) {
+    size_t compressed_size = 0;
+    size_t i = 0;
+    
+    while (i < delta_size) {
+        uint8_t current_byte = delta_data[i];
+        uint8_t count = 1;
+        
+        // Count consecutive identical bytes
+        while (i + count < delta_size && count < 255 && delta_data[i + count] == current_byte) {
+            count++;
+        }
+        
+        if (count > 3 || current_byte == 0) {
+            // Use RLE encoding: 0x00, count, value
+            compressed_buffer[compressed_size++] = 0x00;
+            compressed_buffer[compressed_size++] = count;
+            compressed_buffer[compressed_size++] = current_byte;
+        } else {
+            // Use literal encoding: raw bytes
+            for (uint8_t j = 0; j < count; j++) {
+                compressed_buffer[compressed_size++] = current_byte;
+            }
+        }
+        
+        i += count;
+    }
+    
+    return compressed_size;
+}
+
+/**
+ * @brief Create highly optimized delta frame with compression
+ * @param current Current frame data
+ * @param len Length of frame data
+ * @param delta_buffer Output buffer for delta data
+ * @return Size of delta data in bytes
+ */
+// This function will be moved after global variable declarations
+
+/* ============================================================================
+ * CONSTANTS AND CONFIGURATION
+ * ============================================================================ */
+
+#define INDEX_HTML_PATH "/spiffs/index.html"
+#define DOOM_PALETTE_JS_PATH "/spiffs/doom-palette.js"
+#define MAX_WS_CLIENTS 4
+
+// Network transmission optimization
+#define NETWORK_BUFFER_SIZE 8192  // Increased from 4096 for better throughput
+#define MAX_FRAME_SKIP_RATIO 3    // Skip up to 3 frames in a row if needed
+#define TCP_WINDOW_SIZE 65536     // Optimize TCP window for better throughput
+#define WEBSOCKET_CHUNK_SIZE 4096 // Optimize WebSocket chunk size
+#define WEBSOCKET_TIMEOUT_MS 100  // WebSocket transmission timeout
+static uint32_t consecutive_skips = 0;  // Track consecutive frame skips
+
+/* ============================================================================
+ * GLOBAL VARIABLES
+ * ============================================================================ */
+
+static const char *TAG = "WebSocket Server";
+
+// WebSocket server state
+static httpd_handle_t g_server_handle = NULL;
+static int ws_client_fds[MAX_WS_CLIENTS];
+static int ws_client_count = 0;
+
+// Web page buffer (moved to PSRAM to save internal RAM)
+static char *index_html = NULL;
+
+// Pre-allocated delta encoding buffers (avoid dynamic allocation overhead)
+static uint8_t *delta_buffer = NULL;
+static uint8_t *previous_frame = NULL;
+static bool delta_encoding_initialized = false;
+static const size_t FRAMEBUFFER_SIZE = 320 * 240; // 76,800 bytes
+
+// Memory pool for delta compression (avoid malloc/free overhead)
+static uint8_t *delta_compression_pool = NULL;
+static bool compression_pool_initialized = false;
+
+// Asynchronous network transmission
+static QueueHandle_t network_queue = NULL;
+static TaskHandle_t network_task_handle = NULL;
+static bool async_network_initialized = false;
+static uint32_t frames_skipped = 0;  // Track skipped frames for monitoring
+
+// Network transmission message structure
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    uint8_t palette_index;
+    bool is_delta;
+} network_message_t;
+
+/* ============================================================================
+ * FUNCTION DEFINITIONS
+ * ============================================================================ */
+
+/**
+ * @brief Create highly optimized delta frame with improved algorithms
+ * @param current Current frame data
+ * @param len Length of frame data
+ * @param delta_buffer Buffer to store delta data
+ * @return Size of delta data in bytes
+ */
+static size_t create_highly_optimized_delta_frame(const uint8_t *current, size_t len, uint8_t *delta_buffer) {
+    size_t delta_size = 0;
+    const uint32_t *current_words = (const uint32_t*)current;
+    const uint32_t *previous_words = (const uint32_t*)previous_frame;
+    const size_t word_count = len / 4;
+    
+    // Pre-calculate buffer capacity to avoid bounds checking in loop
+    const size_t max_delta_size = len - 10;  // Leave room for safety
+    
+    // Process words (4 bytes at a time) for better performance
+    for (size_t i = 0; i < word_count && delta_size < max_delta_size; i++) {
+        uint32_t current_word = current_words[i];
+        uint32_t previous_word = previous_words[i];
+        
+        if (current_word != previous_word) {
+            // Optimized: Use bit counting for significant change detection
+            uint32_t diff = current_word ^ previous_word;
+            uint8_t bit_count = __builtin_popcount(diff);
+            
+            // Only process if difference is significant (more than 2 bits different)
+            if (bit_count > 2) {
+                size_t base_pos = i * 4;
+                
+                // Unrolled loop for better performance
+                uint8_t pos_high = (base_pos >> 8) & 0xFF;
+                uint8_t pos_low = base_pos & 0xFF;
+                
+                // Check each byte efficiently
+                uint8_t curr_byte0 = (current_word >> 0) & 0xFF;
+                uint8_t prev_byte0 = (previous_word >> 0) & 0xFF;
+                if (curr_byte0 != prev_byte0) {
+                    delta_buffer[delta_size++] = pos_high;
+                    delta_buffer[delta_size++] = pos_low;
+                    delta_buffer[delta_size++] = curr_byte0;
+                }
+                
+                uint8_t curr_byte1 = (current_word >> 8) & 0xFF;
+                uint8_t prev_byte1 = (previous_word >> 8) & 0xFF;
+                if (curr_byte1 != prev_byte1) {
+                    delta_buffer[delta_size++] = pos_high;
+                    delta_buffer[delta_size++] = pos_low + 1;
+                    delta_buffer[delta_size++] = curr_byte1;
+                }
+                
+                uint8_t curr_byte2 = (current_word >> 16) & 0xFF;
+                uint8_t prev_byte2 = (previous_word >> 16) & 0xFF;
+                if (curr_byte2 != prev_byte2) {
+                    delta_buffer[delta_size++] = pos_high;
+                    delta_buffer[delta_size++] = pos_low + 2;
+                    delta_buffer[delta_size++] = curr_byte2;
+                }
+                
+                uint8_t curr_byte3 = (current_word >> 24) & 0xFF;
+                uint8_t prev_byte3 = (previous_word >> 24) & 0xFF;
+                if (curr_byte3 != prev_byte3) {
+                    delta_buffer[delta_size++] = pos_high;
+                    delta_buffer[delta_size++] = pos_low + 3;
+                    delta_buffer[delta_size++] = curr_byte3;
+                }
+            }
+        }
+    }
+    
+    // Process remaining bytes efficiently
+    size_t remaining_start = word_count * 4;
+    for (size_t i = remaining_start; i < len && delta_size < max_delta_size; i++) {
+        if (current[i] != previous_frame[i]) {
+            delta_buffer[delta_size++] = (i >> 8) & 0xFF;
+            delta_buffer[delta_size++] = i & 0xFF;
+            delta_buffer[delta_size++] = current[i];
+        }
+    }
+    
+    return delta_size;
+}
+
+/* ============================================================================
+ * WEB SOCKET CLIENT MANAGEMENT
+ * ============================================================================ */
+
+/**
+ * @brief Add a client file descriptor to the client list
+ * @param fd File descriptor of the client to add
+ */
+static void ws_add_client(int fd) {
+    for (int i = 0; i < ws_client_count; ++i) {
+        if (ws_client_fds[i] == fd) {
+            return; // Already present
+        }
+    }
+    if (ws_client_count < MAX_WS_CLIENTS) {
+        ws_client_fds[ws_client_count++] = fd;
+        ESP_LOGI(TAG, "Client added, total clients: %d", ws_client_count);
+    }
+}
+
+/**
+ * @brief Remove a client file descriptor from the client list
+ * @param fd File descriptor of the client to remove
+ */
+static void ws_remove_client(int fd) {
+    for (int i = 0; i < ws_client_count; ++i) {
+        if (ws_client_fds[i] == fd) {
+            ws_client_fds[i] = ws_client_fds[--ws_client_count];
+            ESP_LOGI(TAG, "Client removed, total clients: %d", ws_client_count);
+            return;
+        }
+    }
+}
+
+
+
+/**
+ * @brief Broadcast framebuffer data to all connected WebSocket clients (race-condition-safe)
+ * @param data Pointer to the framebuffer data (screenbuf_backup)
+ * @param len Length of the data in bytes
+ * @param palette_index Palette index to include in message
+ */
+void ws_broadcast_framebuffer(const void *data, size_t len, uint8_t palette_index) {
+    if (g_server_handle == NULL || ws_client_count == 0) {
+        return; // No server or no clients connected
+    }
+    
+    // Safety check: ensure data is valid
+    if (data == NULL || len == 0) {
+        ESP_LOGW(TAG, "Invalid framebuffer data: data=%p, len=%zu", data, len);
+        return;
+    }
+    
+    // Safety check: ensure data size is reasonable
+    if (len > FRAMEBUFFER_SIZE) {
+        ESP_LOGW(TAG, "Framebuffer size too large: %zu > %zu", len, FRAMEBUFFER_SIZE);
+        return;
+    }
+    
+    // Safety check: ensure network queue is initialized
+    if (network_queue == NULL) {
+        ESP_LOGW(TAG, "Network queue not initialized");
+        return;
+    }
+    
+    // Screen wipe detection: if we're getting rapid framebuffer updates with high entropy,
+    // it's likely a screen wipe animation. Skip delta encoding during wipes.
+    static uint32_t frame_count = 0;
+    static uint32_t last_frame_time = 0;
+    static bool in_screen_wipe = false;
+    
+    uint32_t current_time = esp_timer_get_time() / 1000; // Convert to milliseconds
+    frame_count++;
+    
+    // Detect rapid frame updates (screen wipe typically has very fast updates)
+    if (current_time - last_frame_time < 50) { // Less than 50ms between frames
+        if (!in_screen_wipe) {
+            ESP_LOGI(TAG, "Screen wipe detected - switching to full frame mode");
+            in_screen_wipe = true;
+        }
+    } else if (current_time - last_frame_time > 200) { // More than 200ms between frames
+        if (in_screen_wipe) {
+            ESP_LOGI(TAG, "Screen wipe ended - resuming delta encoding");
+            in_screen_wipe = false;
+        }
+    }
+    
+    // Additional detection: if we have a previous frame, check for high entropy changes
+    // Screen wipes typically have very high frame-to-frame differences
+    if (previous_frame && !in_screen_wipe && current_time - last_frame_time < 100) {
+        uint32_t diff_count = 0;
+        const uint32_t *current_words = (const uint32_t*)data;
+        const uint32_t *prev_words = (const uint32_t*)previous_frame;
+        const size_t word_count = len / 4;
+        
+        // Sample check: look at every 16th word to avoid performance impact
+        for (size_t i = 0; i < word_count; i += 16) {
+            if (current_words[i] != prev_words[i]) {
+                diff_count++;
+            }
+        }
+        
+        // If more than 30% of sampled pixels are different, it might be a screen wipe
+        if (diff_count > (word_count / 16) * 0.3) {
+            ESP_LOGI(TAG, "High entropy frame detected - possible screen wipe");
+            in_screen_wipe = true;
+        }
+    }
+    
+    last_frame_time = current_time;
+    
+    ESP_LOGD(TAG, "Queuing framebuffer for async transmission, size: %zu bytes, palette: %d", 
+              len, palette_index);
+
+#if ENABLE_DELTA_ENCODING
+    // Skip delta encoding during screen wipes to avoid race conditions
+    if (in_screen_wipe) {
+        ESP_LOGD(TAG, "Screen wipe in progress - using full frame transmission");
+        goto send_full_frame;
+    }
+    
+    // Initialize delta encoding buffers if needed
+    if (!delta_encoding_initialized || delta_buffer == NULL || previous_frame == NULL) {
+        esp_err_t ret = init_delta_encoding_buffers();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Delta encoding initialization failed, using full frame transmission");
+            goto send_full_frame;
+        }
+    }
+
+    // Use pre-allocated buffers (no dynamic allocation overhead)
+    if (delta_buffer && previous_frame) {
+        // Initialize previous frame on first call
+        static bool first_frame = true;
+        if (first_frame) {
+            memcpy(previous_frame, data, len);
+            first_frame = false;
+            ESP_LOGI(TAG, "Delta encoding initialized with first frame");
+        }
+        
+        // Create optimized delta frame
+        size_t delta_size = create_highly_optimized_delta_frame((const uint8_t*)data, len, delta_buffer);
+        
+        // Try RLE compression on delta frame
+        if (delta_size > 0 && compression_pool_initialized && delta_compression_pool != NULL) {
+            size_t compressed_size = compress_delta_rle(delta_buffer, delta_size, delta_compression_pool);
+            
+            // Use compressed version if it's smaller
+            if (compressed_size < delta_size && compressed_size < len * 0.6) {
+                ESP_LOGD(TAG, "RLE compression: %zu → %zu bytes (%.1f%% reduction)", 
+                         delta_size, compressed_size, (1.0 - (double)compressed_size/delta_size) * 100);
+                memcpy(delta_buffer, delta_compression_pool, compressed_size);
+                delta_size = compressed_size;
+            }
+        }
+        
+        // Update previous frame for next comparison
+        // Skip updating during screen wipes to avoid race conditions
+        if (!in_screen_wipe) {
+            memcpy(previous_frame, data, len);
+        }
+        
+        // If delta is significantly smaller than full frame, send delta
+        if (delta_size < len * 0.7) { // More aggressive threshold (70% vs 80%)
+            ESP_LOGD(TAG, "Queuing optimized delta frame: %zu bytes (vs %zu bytes full frame)", delta_size, len);
+            
+            // Queue delta frame for asynchronous transmission
+            network_message_t msg = {
+                .data = delta_buffer,
+                .len = delta_size,
+                .palette_index = palette_index,
+                .is_delta = true
+            };
+            
+            if (xQueueSend(network_queue, &msg, 0) != pdTRUE) {
+                frames_skipped++;
+                consecutive_skips++;
+                
+                // Adaptive frame skipping: if we're skipping too many consecutive frames, 
+                // force a frame transmission to prevent client timeout
+                if (consecutive_skips >= MAX_FRAME_SKIP_RATIO) {
+                    ESP_LOGW(TAG, "Too many consecutive skips (%lu), forcing frame transmission", consecutive_skips);
+                    // Force transmission by waiting for queue space
+                    if (xQueueSend(network_queue, &msg, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        consecutive_skips = 0;  // Reset counter
+                        ESP_LOGI(TAG, "Forced frame transmission successful");
+                    }
+                }
+                
+                ESP_LOGW(TAG, "Network queue full, dropping %s frame (total skipped: %lu, consecutive: %lu)", 
+                         msg.is_delta ? "delta" : "full", frames_skipped, consecutive_skips);
+                // Log queue statistics
+                UBaseType_t queue_spaces = uxQueueSpacesAvailable(network_queue);
+                UBaseType_t queue_messages = uxQueueMessagesWaiting(network_queue);
+                ESP_LOGD(TAG, "Queue stats: %d spaces, %d messages", queue_spaces, queue_messages);
+                
+                // Skip this frame entirely - don't process delta encoding
+                return;  // Exit early to skip frame processing
+            } else {
+                consecutive_skips = 0;  // Reset consecutive skip counter on successful transmission
+                // Log successful queue operations occasionally
+                static int queue_success_count = 0;
+                queue_success_count++;
+                if (queue_success_count % 100 == 0) {
+                    UBaseType_t queue_spaces = uxQueueSpacesAvailable(network_queue);
+                    ESP_LOGI(TAG, "Network queue healthy: %d spaces available", queue_spaces);
+                }
+            }
+        } else {
+            ESP_LOGD(TAG, "Delta too large, queuing full frame");
+            goto send_full_frame;
+        }
+    } else {
+        ESP_LOGW(TAG, "Delta encoding buffers not available, using full frame");
+        goto send_full_frame;
+    }
+#else
+    // Full frame transmission (delta encoding disabled)
+    goto send_full_frame;
+#endif
+
+send_full_frame:
+    // Queue full frame for asynchronous transmission
+    // Cast to uint8_t* to access the extra byte at the end
+    uint8_t *framebuffer_with_palette = (uint8_t*)data;
+    
+    network_message_t msg = {
+        .data = framebuffer_with_palette,
+        .len = len,
+        .palette_index = palette_index,
+        .is_delta = false
+    };
+    
+    if (xQueueSend(network_queue, &msg, 0) != pdTRUE) {
+        frames_skipped++;
+        ESP_LOGW(TAG, "Network queue full, dropping full frame (total skipped: %lu)", frames_skipped);
+        // Log queue statistics
+        UBaseType_t queue_spaces = uxQueueSpacesAvailable(network_queue);
+        UBaseType_t queue_messages = uxQueueMessagesWaiting(network_queue);
+        ESP_LOGD(TAG, "Queue stats: %d spaces, %d messages", queue_spaces, queue_messages);
+    } else {
+        // Log successful queue operations occasionally
+        static int queue_success_count = 0;
+        queue_success_count++;
+        if (queue_success_count % 100 == 0) {
+            UBaseType_t queue_spaces = uxQueueSpacesAvailable(network_queue);
+            ESP_LOGI(TAG, "Network queue healthy: %d spaces available", queue_spaces);
+        }
+    }
+}
+
+/**
+ * @brief Initialize delta encoding buffers (pre-allocated to avoid overhead)
+ * @return ESP_OK on success, ESP_ERR_* on failure
+ */
+static esp_err_t init_delta_encoding_buffers(void) {
+    if (delta_encoding_initialized) {
+        return ESP_OK; // Already initialized
+    }
+
+    ESP_LOGI(TAG, "Initializing delta encoding buffers");
+
+    // Allocate delta buffer in PSRAM
+    delta_buffer = heap_caps_malloc(FRAMEBUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    if (!delta_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate delta buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Allocate previous frame buffer in PSRAM
+    previous_frame = heap_caps_malloc(FRAMEBUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    if (!previous_frame) {
+        // Fallback to regular malloc if PSRAM allocation fails
+        previous_frame = malloc(FRAMEBUFFER_SIZE);
+        if (!previous_frame) {
+            ESP_LOGE(TAG, "Failed to allocate previous frame buffer");
+            heap_caps_free(delta_buffer);
+            delta_buffer = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    // Allocate compression pool for delta frames
+    delta_compression_pool = heap_caps_malloc(FRAMEBUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    if (!delta_compression_pool) {
+        // Fallback to regular malloc if PSRAM allocation fails
+        delta_compression_pool = malloc(FRAMEBUFFER_SIZE);
+        if (!delta_compression_pool) {
+            ESP_LOGE(TAG, "Failed to allocate compression pool");
+            heap_caps_free(delta_buffer);
+            heap_caps_free(previous_frame);
+            delta_buffer = NULL;
+            previous_frame = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    delta_encoding_initialized = true;
+    compression_pool_initialized = true;
+    ESP_LOGI(TAG, "Delta encoding buffers initialized successfully");
+    return ESP_OK;
+}
+
+/**
+ * @brief Clean up delta encoding buffers
+ */
+static void cleanup_delta_encoding_buffers(void) {
+    if (delta_buffer) {
+        heap_caps_free(delta_buffer);
+        delta_buffer = NULL;
+    }
+    
+    if (previous_frame) {
+        heap_caps_free(previous_frame);
+        previous_frame = NULL;
+    }
+    
+    if (delta_compression_pool) {
+        heap_caps_free(delta_compression_pool);
+        delta_compression_pool = NULL;
+    }
+    
+    delta_encoding_initialized = false;
+    compression_pool_initialized = false;
+    ESP_LOGI(TAG, "Delta encoding buffers cleaned up");
+}
+
+/**
+ * @brief Optimized delta encoding with word-aligned comparisons
+ * @param current Current frame data
+ * @param len Length of frame data
+ * @param delta_buffer Output buffer for delta data
+ * @return Size of delta data in bytes
+ */
+static size_t create_optimized_delta_frame(const uint8_t *current, size_t len, uint8_t *delta_buffer) {
+    size_t delta_size = 0;
+    const uint32_t *current_words = (const uint32_t*)current;
+    const uint32_t *previous_words = (const uint32_t*)previous_frame;
+    const size_t word_count = len / 4;
+    
+    // Process words (4 bytes at a time) for better performance
+    for (size_t i = 0; i < word_count; i++) {
+        uint32_t current_word = current_words[i];
+        uint32_t previous_word = previous_words[i];
+        
+        if (current_word != previous_word) {
+            // Word has changed - process individual bytes
+            size_t base_pos = i * 4;
+            for (size_t j = 0; j < 4; j++) {
+                uint8_t current_byte = (current_word >> (j * 8)) & 0xFF;
+                uint8_t previous_byte = (previous_word >> (j * 8)) & 0xFF;
+                
+                if (current_byte != previous_byte) {
+                    size_t pos = base_pos + j;
+                    if (delta_size + 2 < len) {
+                        delta_buffer[delta_size++] = (pos >> 8) & 0xFF; // High byte
+                        delta_buffer[delta_size++] = pos & 0xFF;         // Low byte
+                        delta_buffer[delta_size++] = current_byte;       // New value
+                    }
+                }
+            }
+        }
+    }
+    
+    // Process remaining bytes (if any)
+    size_t remaining_start = word_count * 4;
+    for (size_t i = remaining_start; i < len; i++) {
+        if (current[i] != previous_frame[i]) {
+            if (delta_size + 2 < len) {
+                delta_buffer[delta_size++] = (i >> 8) & 0xFF; // High byte
+                delta_buffer[delta_size++] = i & 0xFF;         // Low byte
+                delta_buffer[delta_size++] = current[i];       // New value
+            }
+        }
+    }
+    
+    return delta_size;
+}
+
+/**
+ * @brief Initialize asynchronous network transmission
+ * @return ESP_OK on success, ESP_ERR_* on failure
+ */
+static esp_err_t init_async_network_transmission(void) {
+    if (async_network_initialized) {
+        return ESP_OK; // Already initialized
+    }
+
+    ESP_LOGI(TAG, "Initializing asynchronous network transmission");
+
+    // Create queue for network messages
+    network_queue = xQueueCreate(8, sizeof(network_message_t));  // Increased from 3 to 8
+    if (!network_queue) {
+        ESP_LOGE(TAG, "Failed to create network queue");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Create network transmission task
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        network_transmission_task,
+        "network_tx",
+        4096,
+        NULL,
+        3, // Priority higher than Doom task
+        &network_task_handle,
+        0  // Pin to Core 0 (WiFi core)
+    );
+
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create network transmission task");
+        vQueueDelete(network_queue);
+        network_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    async_network_initialized = true;
+    ESP_LOGI(TAG, "Asynchronous network transmission initialized successfully");
+    return ESP_OK;
+}
+
+/**
+ * @brief Clean up asynchronous network transmission
+ */
+static void cleanup_async_network_transmission(void) {
+    if (network_task_handle) {
+        vTaskDelete(network_task_handle);
+        network_task_handle = NULL;
+    }
+    
+    if (network_queue) {
+        vQueueDelete(network_queue);
+        network_queue = NULL;
+    }
+    
+    async_network_initialized = false;
+    ESP_LOGI(TAG, "Asynchronous network transmission cleaned up");
+}
+
+/**
+ * @brief Network transmission task (runs on Core 0)
+ * @param pvParameters Task parameters (unused)
+ */
+static void network_transmission_task(void *pvParameters) {
+    network_message_t msg;
+    
+    ESP_LOGI(TAG, "Network transmission task started on Core %d", xPortGetCoreID());
+    
+    while (1) {
+        // Wait for network message
+        if (xQueueReceive(network_queue, &msg, portMAX_DELAY) == pdTRUE) {
+            if (g_server_handle && ws_client_count > 0) {
+                // Send to all clients with optimized settings
+                for (int i = 0; i < ws_client_count; i++) {
+                    esp_err_t ret;
+                    
+                    // Use chunked transmission for large frames
+                    if (msg.len > WEBSOCKET_CHUNK_SIZE) {
+                        ret = send_chunked_websocket_frame(g_server_handle, ws_client_fds[i], 
+                                                         msg.data, msg.len, msg.palette_index);
+                    } else {
+                        // Small frame - use optimized transmission
+                        httpd_ws_frame_t ws_pkt;
+                        memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+                        ws_pkt.payload = msg.data;
+                        ws_pkt.len = msg.len + 1;  // data + palette index
+                        ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+                        
+                        // Add palette index at the end
+                        uint8_t *frame_with_palette = malloc(msg.len + 1);
+                        if (frame_with_palette) {
+                            memcpy(frame_with_palette, msg.data, msg.len);
+                            frame_with_palette[msg.len] = msg.palette_index;
+                            ws_pkt.payload = frame_with_palette;
+                            
+                            ret = send_optimized_websocket_frame(g_server_handle, ws_client_fds[i], &ws_pkt);
+                            free(frame_with_palette);
+                        } else {
+                            ESP_LOGE(TAG, "Failed to allocate frame buffer for client %d", i);
+                            ret = ESP_ERR_NO_MEM;
+                        }
+                    }
+                    
+                    if (ret != ESP_OK) {
+                        ESP_LOGE(TAG, "Failed to send optimized WebSocket frame to client %d: %s", i, esp_err_to_name(ret));
+                    }
+                }
+                
+                ESP_LOGD(TAG, "Sent %s frame (%zu bytes) to %d clients", 
+                         msg.is_delta ? "delta" : "full", msg.len, ws_client_count);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Optimize WebSocket transmission parameters for better throughput
+ * @param server_handle HTTP server handle
+ * @param client_fd Client file descriptor
+ * @return ESP_OK on success, ESP_ERR_* on failure
+ */
+static esp_err_t optimize_websocket_transmission(httpd_handle_t server_handle, int client_fd) {
+    if (server_handle == NULL || client_fd < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGD(TAG, "WebSocket transmission optimized for client %d", client_fd);
+    return ESP_OK;
+}
+
+/**
+ * @brief Send WebSocket frame with optimized parameters
+ * @param server_handle HTTP server handle
+ * @param client_fd Client file descriptor
+ * @param ws_pkt WebSocket packet
+ * @return ESP_OK on success, ESP_ERR_* on failure
+ */
+static esp_err_t send_optimized_websocket_frame(httpd_handle_t server_handle, int client_fd, httpd_ws_frame_t *ws_pkt) {
+    if (server_handle == NULL || client_fd < 0 || ws_pkt == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Optimize transmission parameters
+    esp_err_t opt_ret = optimize_websocket_transmission(server_handle, client_fd);
+    if (opt_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to optimize WebSocket transmission for client %d", client_fd);
+    }
+    
+    // Set transmission timeout
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = WEBSOCKET_TIMEOUT_MS * 1000;  // Convert to microseconds
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    
+    // Send frame with optimized parameters
+    esp_err_t ret = httpd_ws_send_frame_async(server_handle, client_fd, ws_pkt);
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send optimized WebSocket frame to client %d: %s", client_fd, esp_err_to_name(ret));
+    }
+    
+    return ret;
+}
+
+/**
+ * @brief Send large WebSocket frame in chunks for better throughput
+ * @param server_handle HTTP server handle
+ * @param client_fd Client file descriptor
+ * @param data Frame data
+ * @param total_len Total data length
+ * @param palette_index Palette index
+ * @return ESP_OK on success, ESP_ERR_* on failure
+ */
+static esp_err_t send_chunked_websocket_frame(httpd_handle_t server_handle, int client_fd, 
+                                             const uint8_t *data, size_t total_len, uint8_t palette_index) {
+    if (server_handle == NULL || client_fd < 0 || data == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // For large frames, send in chunks to improve throughput
+    if (total_len > WEBSOCKET_CHUNK_SIZE) {
+        size_t offset = 0;
+        size_t chunk_size = WEBSOCKET_CHUNK_SIZE;
+        
+        while (offset < total_len) {
+            // Calculate chunk size (last chunk may be smaller)
+            size_t current_chunk_size = (offset + chunk_size > total_len) ? 
+                                       (total_len - offset) : chunk_size;
+            
+            // Create WebSocket frame for this chunk
+            httpd_ws_frame_t ws_pkt;
+            memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+            ws_pkt.payload = (uint8_t*)(data + offset);
+            ws_pkt.len = current_chunk_size;
+            ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+            
+            // Add palette index to first chunk only
+            if (offset == 0) {
+                ws_pkt.len += 1;  // Add space for palette index
+                // Create temporary buffer with palette index
+                uint8_t *chunk_with_palette = malloc(current_chunk_size + 1);
+                if (chunk_with_palette) {
+                    memcpy(chunk_with_palette, data + offset, current_chunk_size);
+                    chunk_with_palette[current_chunk_size] = palette_index;
+                    ws_pkt.payload = chunk_with_palette;
+                    
+                    esp_err_t ret = send_optimized_websocket_frame(server_handle, client_fd, &ws_pkt);
+                    free(chunk_with_palette);
+                    
+                    if (ret != ESP_OK) {
+                        return ret;
+                    }
+                } else {
+                    ESP_LOGE(TAG, "Failed to allocate chunk buffer");
+                    return ESP_ERR_NO_MEM;
+                }
+            } else {
+                // Send chunk without palette index
+                esp_err_t ret = send_optimized_websocket_frame(server_handle, client_fd, &ws_pkt);
+                if (ret != ESP_OK) {
+                    return ret;
+                }
+            }
+            
+            offset += current_chunk_size;
+            
+            // Small delay between chunks to prevent overwhelming the network
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        
+        ESP_LOGD(TAG, "Sent chunked frame: %zu bytes in %zu chunks", total_len, 
+                 (total_len + chunk_size - 1) / chunk_size);
+        return ESP_OK;
+    } else {
+        // Small frame - send normally
+        httpd_ws_frame_t ws_pkt;
+        memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+        ws_pkt.payload = (uint8_t*)data;
+        ws_pkt.len = total_len + 1;  // data + palette index
+        ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+        
+        // Add palette index
+        uint8_t *frame_with_palette = malloc(total_len + 1);
+        if (frame_with_palette) {
+            memcpy(frame_with_palette, data, total_len);
+            frame_with_palette[total_len] = palette_index;
+            ws_pkt.payload = frame_with_palette;
+            
+            esp_err_t ret = send_optimized_websocket_frame(server_handle, client_fd, &ws_pkt);
+            free(frame_with_palette);
+            return ret;
+        } else {
+            ESP_LOGE(TAG, "Failed to allocate frame buffer");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+}
+
+/* ============================================================================
+ * WEB PAGE INITIALIZATION
+ * ============================================================================ */
+
+/**
+ * @brief Initialize web page buffer in PSRAM
+ */
+static void init_web_page_buffer(void) {
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = NULL,
+        .max_files = 5,
+        .format_if_mount_failed = true
+    };
+
+    ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
+
+    // Get file size first
+    struct stat st;
+    if (stat(INDEX_HTML_PATH, &st) != 0) {
+        ESP_LOGE(TAG, "index.html not found at %s", INDEX_HTML_PATH);
+        return;
+    }
+
+    // Allocate buffer in PSRAM
+    index_html = heap_caps_malloc(st.st_size + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!index_html) {
+        ESP_LOGE(TAG, "Failed to allocate index.html buffer in PSRAM");
+        return;
+    }
+
+    // Load index.html
+    FILE *fp = fopen(INDEX_HTML_PATH, "r");
+    if (fp == NULL) {
+        ESP_LOGE(TAG, "Failed to open %s", INDEX_HTML_PATH);
+        free(index_html);
+        index_html = NULL;
+        return;
+    }
+
+    if (fread(index_html, st.st_size, 1, fp) == 0) {
+        ESP_LOGE(TAG, "Failed to read %s", INDEX_HTML_PATH);
+        free(index_html);
+        index_html = NULL;
+    } else {
+        index_html[st.st_size] = '\0'; // Ensure null termination
+        ESP_LOGI(TAG, "Loaded index.html (%ld bytes) to PSRAM", st.st_size);
+    }
+    
+    fclose(fp);
+}
+
+/* ============================================================================
+ * HTTP SERVER HANDLERS
+ * ============================================================================ */
+
+/**
+ * @brief Handle HTTP GET requests for the root path
+ * @param req HTTP request structure
+ * @return ESP_OK on success
+ */
+static esp_err_t index_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "HTTP request received for index.html");
+    
+    if (!index_html) {
+        ESP_LOGE(TAG, "index.html buffer not initialized");
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+    
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, index_html, strlen(index_html));
+    return ESP_OK;
+}
+
+/**
+ * @brief Handle HTTP GET requests for doom-palette.js
+ * @param req HTTP request structure
+ * @return ESP_OK on success
+ */
+static esp_err_t doom_palette_js_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "HTTP request received for doom-palette.js");
+    
+    // Open and read the file directly from SPIFFS
+    FILE *fp = fopen(DOOM_PALETTE_JS_PATH, "r");
+    if (fp == NULL) {
+        ESP_LOGE(TAG, "Failed to open %s", DOOM_PALETTE_JS_PATH);
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+    
+    // Get file size
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    
+    if (file_size <= 0) {
+        ESP_LOGE(TAG, "Invalid file size for %s", DOOM_PALETTE_JS_PATH);
+        fclose(fp);
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+    
+    // Set content type
+    httpd_resp_set_type(req, "application/javascript");
+    
+    // Send file in chunks to avoid memory issues
+    char buffer[1024];
+    size_t bytes_read;
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+        esp_err_t ret = httpd_resp_send_chunk(req, buffer, bytes_read);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to send chunk: %s", esp_err_to_name(ret));
+            fclose(fp);
+            return ret;
+        }
+    }
+    
+    // Send final chunk (empty to indicate end)
+    httpd_resp_send_chunk(req, NULL, 0);
+    
+    fclose(fp);
+    return ESP_OK;
+}
+
+/* ============================================================================
+ * WEB SOCKET ASYNC HANDLING
+ * ============================================================================ */
+
+/**
+ * @brief Structure for async response arguments
+ */
+struct async_resp_arg {
+    httpd_handle_t hd;
+    int fd;
+};
+
+/**
+ * @brief Async send function for WebSocket frames
+ * @param arg Pointer to async_resp_arg structure
+ */
+static void ws_async_send(void *arg) {
+    static const char *data = "Async data";
+    struct async_resp_arg *resp_arg = (struct async_resp_arg *)arg;
+    httpd_handle_t hd = resp_arg->hd;
+    int fd = resp_arg->fd;
+    
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    ws_pkt.payload = (uint8_t*)data;
+    ws_pkt.len = strlen(data);
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+    httpd_ws_send_frame_async(hd, fd, &ws_pkt);
+    free(resp_arg);
+}
+
+/**
+ * @brief Trigger async send for WebSocket frames
+ * @param handle HTTP server handle
+ * @param req HTTP request structure
+ * @return ESP_OK on success
+ */
+static esp_err_t trigger_async_send(httpd_handle_t handle, httpd_req_t *req) {
+    struct async_resp_arg *resp_arg = malloc(sizeof(struct async_resp_arg));
+    if (resp_arg == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    
+    resp_arg->hd = req->handle;
+    resp_arg->fd = httpd_req_to_sockfd(req);
+    
+    esp_err_t ret = httpd_queue_work(handle, ws_async_send, resp_arg);
+    if (ret != ESP_OK) {
+        free(resp_arg);
+    }
+    
+    return ret;
+}
+
+/* ============================================================================
+ * WEB SOCKET REQUEST HANDLING
+ * ============================================================================ */
+
+/**
+ * @brief Handle WebSocket requests
+ * @param req HTTP request structure
+ * @return ESP_OK on success
+ */
+static esp_err_t handle_ws_req(httpd_req_t *req) {
+    // Handle WebSocket handshake
+    if (req->method == HTTP_GET) {
+        ESP_LOGI(TAG, "WebSocket handshake completed, new connection opened");
+        
+        // Add client to list
+        if (ws_client_count < MAX_WS_CLIENTS) {
+            ws_client_fds[ws_client_count] = httpd_req_to_sockfd(req);
+            ws_client_count++;
+            ESP_LOGI(TAG, "Client added, total clients: %d", ws_client_count);
+        } else {
+            ESP_LOGW(TAG, "Maximum number of clients reached, rejecting connection");
+        }
+    }
+
+    httpd_ws_frame_t ws_pkt;
+    uint8_t *buf = NULL;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+    
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame len: %s", 
+                 esp_err_to_name(ret));
+        return ret;
+    }
+
+    if (ws_pkt.len > 0) {
+        buf = calloc(1, ws_pkt.len + 1);
+        if (buf == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate memory for WebSocket buffer");
+            return ESP_ERR_NO_MEM;
+        }
+        
+        ws_pkt.payload = buf;
+        ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "httpd_ws_recv_frame failed: %s", esp_err_to_name(ret));
+            free(buf);
+            return ret;
+        }
+        
+        ESP_LOGI(TAG, "Received WebSocket message: %s", ws_pkt.payload);
+    }
+
+    ESP_LOGD(TAG, "WebSocket frame length: %d", ws_pkt.len);
+
+    // Handle toggle command
+    if (ws_pkt.type == HTTPD_WS_TYPE_TEXT &&
+        strcmp((char *)ws_pkt.payload, "toggle") == 0) {
+        free(buf);
+        return trigger_async_send(req->handle, req);
+    }
+    
+    // Handle client disconnect
+    if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
+        ws_remove_client(httpd_req_to_sockfd(req));
+        ESP_LOGI(TAG, "Client disconnected");
+    }
+    
+    if (buf) {
+        free(buf);
+    }
+    
+    return ESP_OK;
+}
+
+/* ============================================================================
+ * WEB SERVER SETUP AND MANAGEMENT
+ * ============================================================================ */
+
+/**
+ * @brief Setup and start the WebSocket server
+ * @return HTTP server handle on success, NULL on failure
+ */
+httpd_handle_t setup_websocket_server(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 4096;  // Increase stack size to prevent crashes
+    config.task_priority = 2;   // Lower priority than DOOM task
+    static httpd_handle_t server = NULL;
+
+    // Configure URI handlers
+    httpd_uri_t uri_get = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = index_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t doom_palette_js_uri = {
+        .uri = "/doom-palette.js",
+        .method = HTTP_GET,
+        .handler = doom_palette_js_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t ws = {
+        .uri = "/ws",
+        .method = HTTP_GET,
+        .handler = handle_ws_req,
+        .user_ctx = NULL,
+        .is_websocket = true
+    };
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_register_uri_handler(server, &uri_get);
+        httpd_register_uri_handler(server, &doom_palette_js_uri);
+        httpd_register_uri_handler(server, &ws);
+        g_server_handle = server; // Store global reference
+        ESP_LOGI(TAG, "WebSocket server started successfully");
+    } else {
+        ESP_LOGE(TAG, "Failed to start WebSocket server");
+    }
+
+    return server;
+}
+
+/**
+ * @brief Stop the web server
+ * @param server HTTP server handle
+ * @return ESP_OK on success
+ */
+static esp_err_t stop_webserver(httpd_handle_t server) {
+    if (server) {
+        // Stop the httpd server
+        return httpd_stop(server);
+    }
+    return ESP_FAIL;
+}
+
+static void cleanup_resources(void) {
+    ESP_LOGI(TAG, "Cleaning up resources...");
+    
+    // Clean up delta encoding buffers
+    cleanup_delta_encoding_buffers();
+    
+    // Clean up asynchronous network transmission
+    cleanup_async_network_transmission();
+    
+    // Free web page buffer
+    if (index_html) {
+        heap_caps_free(index_html);
+        index_html = NULL;
+    }
+    
+    ESP_LOGI(TAG, "Resources cleaned up");
+}
+
+/* ============================================================================
+ * NETWORK EVENT HANDLERS
+ * ============================================================================ */
+
+/**
+ * @brief Handle network disconnect events
+ * @param arg Server handle pointer
+ * @param event_base Event base
+ * @param event_id Event ID
+ * @param event_data Event data
+ */
+static void disconnect_handler(void* arg, esp_event_base_t event_base,
+                             int32_t event_id, void* event_data) {
+    httpd_handle_t* server = (httpd_handle_t*) arg;
+    if (*server) {
+        ESP_LOGI(TAG, "Network disconnected, stopping web server");
+        if (stop_webserver(*server) == ESP_OK) {
+            *server = NULL;
+            g_server_handle = NULL; // Clear global reference
+        } else {
+            ESP_LOGE(TAG, "Failed to stop web server");
+        }
+    }
+}
+
+/**
+ * @brief Handle network connect events
+ * @param arg Server handle pointer
+ * @param event_base Event base
+ * @param event_id Event ID
+ * @param event_data Event data
+ */
+static void connect_handler(void* arg, esp_event_base_t event_base,
+                          int32_t event_id, void* event_data) {
+    httpd_handle_t* server = (httpd_handle_t*) arg;
+    if (*server == NULL) {
+        ESP_LOGI(TAG, "Network connected, starting web server");
+        *server = setup_websocket_server();
+        g_server_handle = *server; // Update global reference
+    }
+}
+
+/* ============================================================================
+ * DOOM GAME TASK
+ * ============================================================================ */
+
+/**
+ * @brief Doom game task that runs the PrBoom engine
+ * @param pvParameters Task parameters (unused)
+ */
+void doom_task(void *pvParameters) {
+    char const *argv[] = {
+        "doom", "-cout", "ICWEFDA"
+    };
+    
+    ESP_LOGI(TAG, "Starting Doom game task");
+    
+    // Register this task with the watchdog
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+    ESP_ERROR_CHECK(esp_task_wdt_status(NULL));
+    
+    ESP_LOGI(TAG, "Calling doom_main...");
+    doom_main(sizeof(argv)/sizeof(argv[0]), argv);
+    ESP_LOGI(TAG, "doom_main returned (should not happen)");
+}
+
+/* ============================================================================
+ * MAIN APPLICATION
+ * ============================================================================ */
+
+
+
+/**
+ * @brief Main application entry point
+ */
+void app_main(void) {
+    static httpd_handle_t server = NULL;
+
+    ESP_LOGI(TAG, "Starting ESP32 Doom WebSocket Server");
+
+    // Register cleanup function
+    atexit(cleanup_resources);
+
+    // Initialize ESP-IDF components first
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // Connect to network (WiFi or Ethernet) before starting DOOM
+    ESP_ERROR_CHECK(example_connect());
+
+    // Give WiFi a moment to stabilize
+    //vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Set moderate logging levels for debugging
+    esp_log_level_set("wifi", ESP_LOG_WARN);
+    esp_log_level_set("esp_netif_handlers", ESP_LOG_WARN);
+    esp_log_level_set("example_connect", ESP_LOG_WARN);
+    esp_log_level_set("example_common", ESP_LOG_WARN);
+    esp_log_level_set("httpd", ESP_LOG_WARN);
+    esp_log_level_set("httpd_uri", ESP_LOG_WARN);
+    esp_log_level_set("DOOM", ESP_LOG_INFO);
+
+    // Disable WiFi power management to prevent crashes
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    // Register network event handlers
+#ifdef CONFIG_EXAMPLE_CONNECT_WIFI
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, 
+                                             &connect_handler, &server));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, 
+                                             &disconnect_handler, &server));
+#endif // CONFIG_EXAMPLE_CONNECT_WIFI
+
+#ifdef CONFIG_EXAMPLE_CONNECT_ETHERNET
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, 
+                                             &connect_handler, &server));
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ETHERNET_EVENT_DISCONNECTED, 
+                                             &disconnect_handler, &server));
+#endif // CONFIG_EXAMPLE_CONNECT_ETHERNET
+
+    // Initialize web page buffer
+    init_web_page_buffer();
+    
+    // Start the web server for the first time
+    server = setup_websocket_server();
+    g_server_handle = server; // Set global reference
+
+    // Initialize asynchronous network transmission
+    ESP_ERROR_CHECK(init_async_network_transmission());
+
+    // Start Doom game task after HTTP server is initialized
+    ESP_LOGI(TAG, "Creating DOOM task...");
+    BaseType_t task_created = xTaskCreatePinnedToCore(&doom_task, "doom", 32768, NULL, 2, NULL, DOOM_TASK_CORE);
+    if (task_created == pdPASS) {
+        ESP_LOGI(TAG, "DOOM task created successfully on Core %d", DOOM_TASK_CORE);
+    } else {
+        ESP_LOGE(TAG, "Failed to create DOOM task - trying with smaller stack");
+    }
+
+    // Performance monitoring removed to save memory
+}

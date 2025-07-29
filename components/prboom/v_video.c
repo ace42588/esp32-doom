@@ -94,8 +94,16 @@ static const crdef_t crdefs[] = {
 void V_InitColorTranslation(void)
 {
   register const crdef_t *p;
-  for (p=crdefs; p->name; p++)
-    *p->map = W_CacheLumpName(p->name);
+  for (p=crdefs; p->name; p++) {
+    int lump = W_CheckNumForName(p->name);
+    if (lump != -1) {
+      *p->map = W_CacheLumpName(p->name);
+    } else {
+      // Color translation lump not found, use default (no translation)
+      lprintf(LO_WARN, "V_InitColorTranslation: %s not found, using default\n", p->name);
+      *p->map = NULL;
+    }
+  }
 }
 
 //
@@ -518,10 +526,6 @@ void V_UpdateTrueColorPalette(video_mode_t mode) {
   
   int pplump = W_GetNumForName("PLAYPAL");
   const byte *pal = W_CacheLumpNum(pplump);
-  // opengl doesn't use the gamma
-//  const byte *const gtable = 
-  //  (const byte *)GAMMATBL_dat + 
-    //(V_GetMode() == VID_MODEGL ? 0 : 256*(usegamma)) ;
 
   const byte *const gtable = (const byte *)GAMMATBL_dat;
 
@@ -673,9 +677,7 @@ void V_SetPalette(int pal)
   currentPaletteIndex = pal;
 
   if (V_GetMode() == VID_MODEGL) {
-#ifdef GL_DOOM
-    gld_SetPalette(pal);
-#endif
+
   } else {
     I_SetPalette(pal);
     if (V_GetMode() == VID_MODE15 || V_GetMode() == VID_MODE16 || V_GetMode() == VID_MODE32) {
@@ -746,35 +748,6 @@ static void V_PlotPixel15(int scrn, int x, int y, byte color);
 static void V_PlotPixel16(int scrn, int x, int y, byte color);
 static void V_PlotPixel32(int scrn, int x, int y, byte color);
 
-#ifdef GL_DOOM
-static void WRAP_gld_FillRect(int scrn, int x, int y, int width, int height, byte colour)
-{
-  gld_FillBlock(x,y,width,height,colour);
-}
-static void WRAP_gld_CopyRect(int srcx, int srcy, int srcscrn, int width, int height, int destx, int desty, int destscrn, enum patch_translation_e flags)
-{
-}
-static void WRAP_gld_DrawBackground(const char *flatname, int n)
-{
-  gld_DrawBackground(flatname);
-}
-static void WRAP_gld_DrawNumPatch(int x, int y, int scrn, int lump, int cm, enum patch_translation_e flags)
-{
-  gld_DrawNumPatch(x,y,lump,cm,flags);
-}
-static void WRAP_gld_DrawBlock(int x, int y, int scrn, int width, int height, const byte *src, enum patch_translation_e flags)
-{
-}
-static void V_PlotPixelGL(int scrn, int x, int y, byte color) {
-  gld_DrawLine(x-1, y, x+1, y, color);
-  gld_DrawLine(x, y-1, x, y+1, color);
-}
-static void WRAP_gld_DrawLine(fline_t* fl, int color)
-{
-  gld_DrawLine(fl->a.x, fl->a.y, fl->b.x, fl->b.y, color);
-}
-#endif
-
 static void NULL_FillRect(int scrn, int x, int y, int width, int height, byte colour) {}
 static void NULL_CopyRect(int srcx, int srcy, int srcscrn, int width, int height, int destx, int desty, int destscrn, enum patch_translation_e flags) {}
 static void NULL_DrawBackground(const char *flatname, int n) {}
@@ -797,10 +770,8 @@ V_DrawLine_f V_DrawLine = NULL_DrawLine;
 // V_InitMode
 //
 void V_InitMode(video_mode_t mode) {
-#ifndef GL_DOOM
   if (mode == VID_MODEGL)
     mode = VID_MODE8;
-#endif
   switch (mode) {
 	default:
     case VID_MODE8:
@@ -843,18 +814,6 @@ void V_InitMode(video_mode_t mode) {
       V_DrawLine = WRAP_V_DrawLine;
       current_videomode = VID_MODE32;
       break;
-#ifdef GL_DOOM
-    case VID_MODEGL:
-      lprintf(LO_INFO, "V_InitMode: using OpenGL video mode\n");
-      V_CopyRect = WRAP_gld_CopyRect;
-      V_FillRect = WRAP_gld_FillRect;
-      V_DrawNumPatch = WRAP_gld_DrawNumPatch;
-      V_DrawBackground = WRAP_gld_DrawBackground;
-      V_PlotPixel = V_PlotPixelGL;
-      V_DrawLine = WRAP_gld_DrawLine;
-      current_videomode = VID_MODEGL;
-      break;
-#endif
   }
   R_FilterInit();
 }

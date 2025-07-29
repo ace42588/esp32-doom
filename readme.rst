@@ -44,7 +44,7 @@ Doom also needs game data, and ESP32-Doom expects this data to be put in a separ
 Doom/Doom2 version. However, for a 4MiB Wrover32, only a cut-down version of the shareware game data will fit. You can download that data
 `here <https://dl.espressif.com/dl/doom1-cut.wad>`_ and flash it into the ESP32s flash using a command similar to:
 
-``python $IDF_PATH/components/esptool_py/esptool/esptool.py --chip esp32 --port "/dev/ttyUSB1" --baud 230400 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 40m --flash_size detect 0x100000 doom1-cut.wad``
+``python $IDF_PATH/components/esptool_py/esptool/esptool.py --chip esp32 --port "/dev/ttyUSB1" --baud 230400 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 40m --flash_size detect 0x100000 newdoom1_silent.wad``
 
 
 If you want to use a commercial variant of the Doom game data (doom1.wad, doom2.wad, ...), you will need an ESP32-Wrover with 16MiB of flash. 

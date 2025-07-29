@@ -149,18 +149,6 @@ extern int mousebforward;
 
 extern int viewwidth;
 extern int viewheight;
-#ifdef GL_DOOM
-extern int gl_nearclip;
-extern int gl_colorbuffer_bits;
-extern int gl_depthbuffer_bits;
-extern char *gl_tex_filter_string;
-extern char *gl_tex_format_string;
-extern int gl_drawskys;
-extern int gl_sortsprites;
-extern int gl_use_paletted_texture;
-extern int gl_use_shared_texture_palette;
-extern int gl_sprite_offset;
-#endif
 
 extern int realtic_clock_rate;         // killough 4/13/98: adjustable timer
 extern int tran_filter_pct;            // killough 2/21/98
@@ -304,15 +292,7 @@ default_t defaults[] =
   {"snd_channels",{&default_numChannels},{8},1,32,
    def_int,ss_none}, // number of audio events simultaneously // killough
   {"Video settings",{NULL},{0},UL,UL,def_none,ss_none},
-#ifdef GL_DOOM
-  #ifdef _MSC_VER
-    {"videomode",{NULL, &default_videomode},{0,"gl"},UL,UL,def_str,ss_none},
-  #else
-    {"videomode",{NULL, &default_videomode},{0,"8"},UL,UL,def_str,ss_none},
-  #endif
-#else
   {"videomode",{NULL, &default_videomode},{0,"8"},UL,UL,def_str,ss_none},
-#endif
   /* 640x480 default resolution */
   {"screen_width",{&desired_screenwidth},{320}, 320, MAX_SCREENWIDTH,
    def_int,ss_none},
@@ -350,32 +330,6 @@ default_t defaults[] =
    RDRAW_MASKEDCOLUMNEDGE_SQUARE, RDRAW_MASKEDCOLUMNEDGE_SLOPED, def_int,ss_none},
   {"patch_edges",{(int*)&drawvars.patch_edges},{RDRAW_MASKEDCOLUMNEDGE_SQUARE},
    RDRAW_MASKEDCOLUMNEDGE_SQUARE, RDRAW_MASKEDCOLUMNEDGE_SLOPED, def_int,ss_none},
-
-#ifdef GL_DOOM
-  {"OpenGL settings",{NULL},{0},UL,UL,def_none,ss_none},
-  {"gl_nearclip",{&gl_nearclip},{5},0,UL,
-   def_int,ss_none}, /* near clipping plane pos */
-  {"gl_colorbuffer_bits",{&gl_colorbuffer_bits},{16},16,32,
-   def_int,ss_none},
-  {"gl_depthbuffer_bits",{&gl_depthbuffer_bits},{16},16,32,
-   def_int,ss_none},
-  {"gl_tex_filter_string", {NULL,&gl_tex_filter_string}, {0,"GL_LINEAR"},UL,UL,
-   def_str,ss_none},
-  {"gl_tex_format_string", {NULL,&gl_tex_format_string}, {0,"GL_RGB5_A1"},UL,UL,
-   def_str,ss_none},
-  {"gl_drawskys",{&gl_drawskys},{1},0,1,
-   def_bool,ss_none},
-  {"gl_sortsprites",{&gl_sortsprites},{1},0,1,
-   def_bool,ss_none},
-  {"gl_use_paletted_texture",{&gl_use_paletted_texture},{0},0,1,
-   def_bool,ss_none},
-  {"gl_use_shared_texture_palette",{&gl_use_shared_texture_palette},{0},0,1,
-   def_bool,ss_none},
-#ifdef GL_DOOM
-  {"gl_sprite_offset",{&gl_sprite_offset},{0}, 0, 5,
-   def_int,ss_none}, // amount to bring items out of floor (GL) Mead 8/13/03
-#endif
-#endif
 
   {"Mouse settings",{NULL},{0},UL,UL,def_none,ss_none},
   {"use_mouse",{&usemouse},{1},0,1,

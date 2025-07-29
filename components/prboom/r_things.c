@@ -599,19 +599,6 @@ static void R_ProjectSprite (mobj_t* thing, int lightlevel)
   // store information in a vissprite
   vis = R_NewVisSprite ();
 
-#ifdef GL_DOOM
-  if (V_GetMode() == VID_MODEGL)
-  {
-    // proff 11/99: add sprite for OpenGL
-    vis->thing = thing;
-    vis->flip = flip;
-    vis->scale = FixedDiv(projectiony, tz);
-    vis->patch = lump;
-    gld_AddSprite(vis);
-
-    return;
-  }
-#endif
   // killough 3/27/98: save sector for special clipping later
   vis->heightsec = heightsec;
 
@@ -785,30 +772,6 @@ static void R_DrawPSprite (pspdef_t *psp, int lightlevel)
   {
     R_DrawVisSprite(vis, vis->x1, vis->x2);
   }
-#ifdef GL_DOOM
-  else
-  {
-    int lightlevel;
-    sector_t tmpsec;
-    int floorlightlevel, ceilinglightlevel;
-
-    if ((vis->colormap==fixedcolormap) || (vis->colormap==fullcolormap))
-      lightlevel=255;
-    else
-    {
-//      lightlevel = (viewplayer->mo->subsector->sector->lightlevel) + (extralight << LIGHTSEGSHIFT);
-      R_FakeFlat( viewplayer->mo->subsector->sector, &tmpsec,
-                  &floorlightlevel, &ceilinglightlevel, false);
-      lightlevel = ((floorlightlevel+ceilinglightlevel) >> 1) + (extralight << LIGHTSEGSHIFT);
-
-      if (lightlevel < 0)
-        lightlevel = 0;
-      else if (lightlevel >= 255)
-        lightlevel = 255;
-    }
-    gld_DrawWeapon(lump,vis,lightlevel);
-  }
-#endif
 }
 
 //

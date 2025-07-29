@@ -75,7 +75,6 @@ int I_Filelength(int handle);
 
 void I_SetAffinityMask(void);
 
-
 int doom_main(int argc, char const * const * argv);
 
 int I_Lseek(int fd, off_t offset, int whence);

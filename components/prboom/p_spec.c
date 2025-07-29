@@ -140,7 +140,15 @@ void P_InitPicAnims (void)
 {
   int         i;
   const animdef_t *animdefs; //jff 3/23/98 pointer to animation lump
-  int         lump = W_GetNumForName("ANIMATED"); // cph - new wad lump handling
+  int         lump = W_CheckNumForName("ANIMATED"); // cph - new wad lump handling
+  
+  if (lump == -1) {
+    // ANIMATED lump not found, use empty animation list
+    lprintf(LO_WARN, "P_InitPicAnims: ANIMATED lump not found, using empty animation list\n");
+    lastanim = anims;
+    return;
+  }
+  
   //  Init animation
 
   //jff 3/23/98 read from predefined or wad lump instead of table
