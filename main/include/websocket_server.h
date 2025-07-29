@@ -7,32 +7,49 @@
 
 // WebSocket server configuration
 #define MAX_WS_CLIENTS 1
-#define ENABLE_DELTA_ENCODING 0  // Disabled for FPS performance
+#define INDEX_HTML_PATH "/spiffs/index.html"
+#define DOOM_PALETTE_JS_PATH "/spiffs/doom-palette.js"
 
-// Global server state (extern declarations)
-extern httpd_handle_t g_server_handle;
-extern int ws_client_fds[MAX_WS_CLIENTS];
-extern int ws_client_count;
+#define FRAGMENT_SIZE 16384
 
-// Function declarations
-void ws_add_client(int fd);
-void ws_remove_client(int fd);
-bool ws_is_client_valid(int client_index);
-void ws_cleanup_invalid_clients(void);
-void ws_validate_client_array(void);
-bool ws_check_client_alive(int client_fd);
-void ws_cleanup_stale_clients(void);
-void ws_broadcast_framebuffer(const void *data, size_t len, uint8_t palette_index);
-esp_err_t handle_ws_req(httpd_req_t *req);
-httpd_handle_t setup_websocket_server(void);
-esp_err_t stop_webserver(httpd_handle_t server);
-void cleanup_websocket_resources(void);
-void init_web_page_buffer(void);
+// WebSocket server state
+typedef struct {
+    httpd_handle_t server_handle;
+    int client_fds[MAX_WS_CLIENTS];
+    int client_count;
+    bool is_initialized;
+} websocket_server_t;
+
+// Function declarations for WebSocket server management
+esp_err_t websocket_server_init(void);
+esp_err_t websocket_server_start(void);
+esp_err_t websocket_server_stop(void);
+void websocket_server_cleanup(void);
+
+// Client management functions
+esp_err_t websocket_add_client(int fd);
+esp_err_t websocket_remove_client(int fd);
+int websocket_get_client_count(void);
+int websocket_get_client_fd(int index);
+bool websocket_is_client_valid(int client_index);
+
+// WebSocket frame handling
+esp_err_t websocket_send_binary_frame(int client_fd, const uint8_t *data, size_t len);
+esp_err_t websocket_send_fragmented_frame(int client_fd, const uint8_t *data, size_t len, uint8_t palette_index);
 
 // Network event handlers
-void connect_handler(void* arg, esp_event_base_t event_base,
-                    int32_t event_id, void* event_data);
-void disconnect_handler(void* arg, esp_event_base_t event_base,
-                      int32_t event_id, void* event_data);
+void websocket_connect_handler(void* arg, esp_event_base_t event_base,
+                             int32_t event_id, void* event_data);
+void websocket_disconnect_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data);
+
+// HTTP request handlers
+esp_err_t websocket_index_handler(httpd_req_t *req);
+esp_err_t websocket_palette_handler(httpd_req_t *req);
+esp_err_t websocket_ws_handler(httpd_req_t *req);
+
+// Utility functions
+bool websocket_server_is_ready(void);
+httpd_handle_t websocket_get_server_handle(void);
 
 #endif // WEBSOCKET_SERVER_H 

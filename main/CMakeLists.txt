@@ -2,8 +2,8 @@ idf_component_register(SRCS "main.c"
                      "delta_encoding.c"
                      "http_handlers.c"
                      "network_transmission.c"
-                     "network_transmission_optimizations.c"
                      "websocket_server.c"
+                     "frame_broadcaster.c"
                     PRIV_REQUIRES esp_http_server esp_wifi nvs_flash spiffs esp_eth fatfs prboom prboom-esp32-compat esp_timer esp_psram
                     INCLUDE_DIRS include)
 

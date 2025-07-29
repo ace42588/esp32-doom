@@ -8,45 +8,25 @@
 extern "C" {
 #endif
 
-// Web page paths
-#define INDEX_HTML_PATH "/spiffs/index.html"
-#define DOOM_PALETTE_JS_PATH "/spiffs/doom-palette.js"
+// HTTP response structure for static files
+typedef struct {
+    const char *content_type;
+    const char *data;
+    size_t length;
+} http_static_file_t;
 
-/**
- * @brief Handle HTTP GET requests for the root path
- * @param req HTTP request structure
- * @return ESP_OK on success
- */
-esp_err_t index_handler(httpd_req_t *req);
+// Function declarations for HTTP request handling
+esp_err_t http_index_handler(httpd_req_t *req);
+esp_err_t http_palette_handler(httpd_req_t *req);
+esp_err_t http_ws_handler(httpd_req_t *req);
 
-/**
- * @brief Handle HTTP GET requests for doom-palette.js
- * @param req HTTP request structure
- * @return ESP_OK on success
- */
-esp_err_t doom_palette_js_handler(httpd_req_t *req);
+// Static file management
+esp_err_t http_load_static_files(void);
+void http_cleanup_static_files(void);
 
-/**
- * @brief Structure for async response arguments
- */
-struct async_resp_arg {
-    httpd_handle_t hd;
-    int fd;
-};
-
-/**
- * @brief Async send function for WebSocket frames
- * @param arg Pointer to async_resp_arg structure
- */
-void ws_async_send(void *arg);
-
-/**
- * @brief Trigger async send for WebSocket frames
- * @param handle HTTP server handle
- * @param req HTTP request structure
- * @return ESP_OK on success
- */
-esp_err_t trigger_async_send(httpd_handle_t handle, httpd_req_t *req);
+// Utility functions
+const char* http_get_content_type(const char *filename);
+esp_err_t http_send_file_response(httpd_req_t *req, const char *filepath, const char *content_type);
 
 #ifdef __cplusplus
 }

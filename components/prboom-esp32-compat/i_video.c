@@ -54,35 +54,27 @@
 #include "esp_task.h"
 #include "esp_heap_caps.h"
 
-#include "ws_doom_server.h"
+#include "frame_broadcaster.h"
+
+int use_doublebuffer = 0;
+int use_fullscreen = 0;
+int desired_fullscreen = 0;
 
 portMUX_TYPE myMutex = portMUX_INITIALIZER_UNLOCKED;
 
 // Global framebuffer variables
 unsigned char *screenbuf;
-unsigned char *screenbuf_backup;  // Backup buffer for WebSocket (prevents race conditions)
+static uint8_t current_palette = 0;
 
-int use_fullscreen=0;
-int use_doublebuffer=0;
-
-
+/* I_StartTic
+ * Called by D_DoomLoop,
+ * called before processing each tic in a frame.
+ * Quick synchronous operations are performed here.
+ * Can call D_PostEvent.
+ */
 void I_StartTic (void)
 {
 }
-
-
-static void I_InitInputs(void)
-{
-}
-
-
-
-static void I_UploadNewPalette(int pal)
-{
-}
-
-//////////////////////////////////////////////////////////////////////////////
-// Graphics API
 
 void I_ShutdownGraphics(void)
 {
@@ -95,9 +87,18 @@ void I_UpdateNoBlit (void)
 {
 }
 
-
+/* I_StartFrame
+ * Called by D_DoomLoop,
+ * called before processing any tics in a frame
+ * (just after displaying a frame).
+ * Time consuming synchronous operations
+ * are performed here (joystick reading).
+ * Can call D_PostEvent.
+ */
 void I_StartFrame (void)
 {
+  // Broadcast the previous frame while the current frame is being rendered
+  broadcast_framebuffer(screenbuf, SCREENWIDTH*SCREENHEIGHT, current_palette);
 }
 
 
@@ -114,23 +115,15 @@ void I_EndDisplay(void)
 // I_FinishUpdate
 //
 
-static uint8_t current_palette = 0; // Track current palette
-
 void I_FinishUpdate (void)
 {
     uint8_t *scr=(uint8_t*)screens[0].data;
     
-    // Copy current frame to backup buffer to prevent race conditions
+    // Copy current frame to backup buffer
     // Use a critical section to prevent concurrent access
     taskENTER_CRITICAL(&myMutex);
-    memcpy(screenbuf_backup, scr, SCREENWIDTH*SCREENHEIGHT);
+    memcpy(screenbuf, scr, SCREENWIDTH*SCREENHEIGHT);
     taskEXIT_CRITICAL(&myMutex);
-    
-    // Broadcast from backup buffer (safe from concurrent writes)
-    ws_broadcast_framebuffer(screenbuf_backup, SCREENWIDTH*SCREENHEIGHT, current_palette);
-    
-    // Flip framebuffers
-    //if (scr==screena) screens[0].data=screenb; else screens[0].data=screena;
 }
 
 void I_SetPalette (int pal)
@@ -154,13 +147,8 @@ void I_PreInitGraphics(void)
 	screenbuf = heap_caps_malloc(SCREENWIDTH*SCREENHEIGHT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	assert(screenbuf);
 	
-	// Allocate backup buffer for WebSocket (prevents race conditions)
-	// Add 1 extra byte for palette index
-	screenbuf_backup = heap_caps_malloc(SCREENWIDTH*SCREENHEIGHT + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-	assert(screenbuf_backup);
-	
-	lprintf(LO_INFO, "Allocated framebuffers: main=%p, backup=%p, size=%d", 
-	        screenbuf, screenbuf_backup, SCREENWIDTH*SCREENHEIGHT);
+	lprintf(LO_INFO, "Allocated framebuffers: main=%p, size=%d", 
+	        screenbuf, SCREENWIDTH*SCREENHEIGHT);
 }
 
 
@@ -214,8 +202,6 @@ void I_UpdateVideoMode(void)
   video_mode_t mode;
 
   lprintf(LO_INFO, "I_UpdateVideoMode: %dx%d\n", SCREENWIDTH, SCREENHEIGHT);
-
-  //mode = VID_MODE16;
   mode = VID_MODE8;
 
   V_InitMode(mode);

@@ -1,13 +1,5 @@
 #include "websocket_server.h"
-#include "network_transmission.h"
 #include "http_handlers.h"
-
-// Force delta encoding to be disabled
-#undef ENABLE_DELTA_ENCODING
-#define ENABLE_DELTA_ENCODING 0
-
-// Framebuffer size constant
-#define FRAMEBUFFER_SIZE (320 * 240)  // 76,800 bytes
 
 #include "esp_log.h"
 #include "esp_spiffs.h"
@@ -26,276 +18,196 @@
 
 static const char *TAG = "WebSocket Server";
 
-// WebSocket server state
-httpd_handle_t g_server_handle = NULL;
-int ws_client_fds[MAX_WS_CLIENTS];
-int ws_client_count = 0;
-
-// Initialize client file descriptors to invalid values
-static void init_client_fds(void) {
-    for (int i = 0; i < MAX_WS_CLIENTS; i++) {
-        ws_client_fds[i] = -1;
-    }
-    ws_client_count = 0;
-}
+// WebSocket server instance
+static websocket_server_t g_websocket_server = {0};
 
 // Web page buffer (moved to PSRAM to save internal RAM)
-char *index_html = NULL;
-
-// Network transmission message structure - defined in network_transmission.h
+static char *g_index_html = NULL;
+static char *g_palette_js = NULL;
 
 /* ============================================================================
  * WEB SOCKET CLIENT MANAGEMENT
  * ============================================================================ */
 
-void ws_add_client(int fd) {
-    // Validate file descriptor
+esp_err_t websocket_add_client(int fd) {
     if (fd < 0) {
         ESP_LOGW(TAG, "Invalid file descriptor %d, cannot add client", fd);
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
     
     // Check if client is already present
-    for (int i = 0; i < ws_client_count; ++i) {
-        if (ws_client_fds[i] == fd) {
+    for (int i = 0; i < g_websocket_server.client_count; ++i) {
+        if (g_websocket_server.client_fds[i] == fd) {
             ESP_LOGD(TAG, "Client FD %d already present", fd);
-            return; // Already present
+            return ESP_OK; // Already present
         }
     }
     
     // Add new client
-    if (ws_client_count < MAX_WS_CLIENTS) {
-        ws_client_fds[ws_client_count++] = fd;
-        ESP_LOGI(TAG, "Client added (FD: %d), total clients: %d", fd, ws_client_count);
+    if (g_websocket_server.client_count < MAX_WS_CLIENTS) {
+        g_websocket_server.client_fds[g_websocket_server.client_count++] = fd;
+        ESP_LOGI(TAG, "Client added (FD: %d), total clients: %d", fd, g_websocket_server.client_count);
+        return ESP_OK;
     } else {
         ESP_LOGW(TAG, "Maximum number of clients reached, cannot add client FD %d", fd);
+        return ESP_ERR_NO_MEM;
     }
 }
 
-void ws_remove_client(int fd) {
-    // Validate file descriptor
+esp_err_t websocket_remove_client(int fd) {
     if (fd < 0) {
         ESP_LOGW(TAG, "Invalid file descriptor %d, cannot remove client", fd);
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
     
-    for (int i = 0; i < ws_client_count; ++i) {
-        if (ws_client_fds[i] == fd) {
+    for (int i = 0; i < g_websocket_server.client_count; ++i) {
+        if (g_websocket_server.client_fds[i] == fd) {
             // Move last client to this position and decrement count
-            ws_client_fds[i] = ws_client_fds[--ws_client_count];
+            g_websocket_server.client_fds[i] = g_websocket_server.client_fds[--g_websocket_server.client_count];
             // Mark the last position as invalid
-            if (ws_client_count > 0) {
-                ws_client_fds[ws_client_count] = -1;
+            if (g_websocket_server.client_count > 0) {
+                g_websocket_server.client_fds[g_websocket_server.client_count] = -1;
             }
-            ESP_LOGI(TAG, "Client removed (FD: %d), total clients: %d", fd, ws_client_count);
-            return;
+            ESP_LOGI(TAG, "Client removed (FD: %d), total clients: %d", fd, g_websocket_server.client_count);
+            return ESP_OK;
         }
     }
     ESP_LOGW(TAG, "Client FD %d not found in client list", fd);
+    return ESP_ERR_NOT_FOUND;
 }
 
-// Add a new function to validate client state
-bool ws_is_client_valid(int client_index) {
+int websocket_get_client_count(void) {
+    return g_websocket_server.client_count;
+}
+
+int websocket_get_client_fd(int index) {
+    if (index >= 0 && index < g_websocket_server.client_count) {
+        return g_websocket_server.client_fds[index];
+    }
+    return -1;
+}
+
+bool websocket_is_client_valid(int client_index) {
     return (client_index >= 0 && 
             client_index < MAX_WS_CLIENTS && 
-            client_index < ws_client_count && 
-            ws_client_fds[client_index] >= 0);
+            client_index < g_websocket_server.client_count && 
+            g_websocket_server.client_fds[client_index] >= 0);
 }
 
-// Add a function to clean up invalid client entries
-void ws_cleanup_invalid_clients(void) {
-    int removed_count = 0;
-    
-    // Ensure client count is valid
-    if (ws_client_count < 0) {
-        ESP_LOGE(TAG, "Invalid client count: %d, resetting to 0", ws_client_count);
-        ws_client_count = 0;
-        return;
-    }
-    
-    if (ws_client_count > MAX_WS_CLIENTS) {
-        ESP_LOGE(TAG, "Invalid client count: %d, resetting to %d", ws_client_count, MAX_WS_CLIENTS);
-        ws_client_count = MAX_WS_CLIENTS;
-    }
-    
-    for (int i = ws_client_count - 1; i >= 0; i--) {
-        if (ws_client_fds[i] < 0) {
-            // Invalid entry found, remove it
-            ESP_LOGW(TAG, "Removing invalid client entry at index %d", i);
-            
-            // Move last client to this position and decrement count
-            if (i < ws_client_count - 1) {
-                ws_client_fds[i] = ws_client_fds[ws_client_count - 1];
-            }
-            ws_client_count--;
-            removed_count++;
-        }
-    }
-    
-    if (removed_count > 0) {
-        ESP_LOGI(TAG, "Cleaned up %d invalid client entries, remaining clients: %d", 
-                 removed_count, ws_client_count);
-    }
-}
+/* ============================================================================
+ * WEB SOCKET FRAME HANDLING
+ * ============================================================================ */
 
-/**
- * @brief Validate client array state and log any issues
- */
-void ws_validate_client_array(void) {
-    bool has_issues = false;
-    
-    // Check for invalid client count
-    if (ws_client_count < 0 || ws_client_count > MAX_WS_CLIENTS) {
-        ESP_LOGE(TAG, "Invalid client count: %d (should be 0-%d)", ws_client_count, MAX_WS_CLIENTS);
-        has_issues = true;
+esp_err_t websocket_send_binary_frame(int client_fd, const uint8_t *data, size_t len) {
+    if (!g_websocket_server.is_initialized || client_fd < 0 || !data || len == 0) {
+        return ESP_ERR_INVALID_ARG;
     }
     
-    // Check for invalid file descriptors in valid range
-    for (int i = 0; i < ws_client_count; i++) {
-        if (ws_client_fds[i] < 0) {
-            ESP_LOGE(TAG, "Invalid FD at index %d: %d", i, ws_client_fds[i]);
-            has_issues = true;
-        }
-    }
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+    ws_pkt.final = 1;
+    ws_pkt.fragmented = 0;
+    ws_pkt.payload = (uint8_t*)data;
+    ws_pkt.len = len;
     
-    // Check for valid FDs outside valid range
-    for (int i = ws_client_count; i < MAX_WS_CLIENTS; i++) {
-        if (ws_client_fds[i] >= 0) {
-            ESP_LOGE(TAG, "Valid FD outside range at index %d: %d", i, ws_client_fds[i]);
-            has_issues = true;
-        }
-    }
-    
-    if (has_issues) {
-        ESP_LOGE(TAG, "Client array validation failed. Current state:");
-        ESP_LOGE(TAG, "  ws_client_count = %d", ws_client_count);
-        for (int i = 0; i < MAX_WS_CLIENTS; i++) {
-            ESP_LOGE(TAG, "  ws_client_fds[%d] = %d", i, ws_client_fds[i]);
-        }
-    }
-}
-
-void ws_broadcast_framebuffer(const void *data, size_t len, uint8_t palette_index) {
-    if (g_server_handle == NULL || ws_client_count == 0) {
-        return; // No server or no clients connected
-    }
-    
-    // Safety check: ensure data is valid
-    if (data == NULL || len == 0) {
-        ESP_LOGW(TAG, "Invalid framebuffer data: data=%p, len=%zu", data, len);
-        return;
-    }
-    
-    
-    // Additional validation: check for reasonable framebuffer size
-    // Expected size is 320x240 = 76,800 bytes
-    if (len != FRAMEBUFFER_SIZE) {
-        ESP_LOGW(TAG, "Unexpected framebuffer size: %zu bytes (expected 76800)", len);
-        // Don't return here, just log the warning
-    }
-    
-    // Safety check: ensure network queue is initialized
-    if (!is_network_transmission_initialized()) {
-        ESP_LOGW(TAG, "Network transmission not initialized");
-        return;
-    }
-    
-    // Debug: Log framebuffer details
-    ESP_LOGD(TAG, "Broadcasting framebuffer: size=%zu, palette=%d, first_byte=0x%02x", 
-             len, palette_index, ((const uint8_t*)data)[0]);
-    
-    ESP_LOGD(TAG, "Queuing framebuffer for async transmission, size: %zu bytes, palette: %d", 
-              len, palette_index);
-
-    // Full frame transmission (delta encoding removed)
-    ESP_LOGI(TAG, "Using full frame transmission");
-    goto send_full_frame;
-
-send_full_frame:
-    // Queue full frame for asynchronous transmission
-    // Cast to uint8_t* to access the extra byte at the end
-    uint8_t *framebuffer_with_palette = (uint8_t*)data;
-    
-    network_message_t msg = {
-        .data = framebuffer_with_palette,
-        .len = len,
-        .palette_index = palette_index,
-        .is_delta = false
-    };
-    
-    if (queue_network_message(&msg) != pdTRUE) {
-        // Frame was dropped due to queue full
-        return;  // Exit early to skip frame processing
-    }
-}
-
-/**
- * @brief Check if a client connection is still alive by sending a ping
- * @param client_fd File descriptor of the client to check
- * @return true if client is alive, false if disconnected
- */
-bool ws_check_client_alive(int client_fd) {
-    if (client_fd < 0 || g_server_handle == NULL) {
-        return false;
-    }
-    
-    // Try to send a ping frame to check if client is still connected
-    httpd_ws_frame_t ping_frame;
-    memset(&ping_frame, 0, sizeof(httpd_ws_frame_t));
-    ping_frame.type = HTTPD_WS_TYPE_PING;
-    ping_frame.len = 0;
-    ping_frame.payload = NULL;
-    
-    esp_err_t ret = httpd_ws_send_frame_async(g_server_handle, client_fd, &ping_frame);
+    esp_err_t ret = httpd_ws_send_frame_async(g_websocket_server.server_handle, client_fd, &ws_pkt);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Client health check failed for FD %d: %s", client_fd, esp_err_to_name(ret));
-        return false;
+        ESP_LOGE(TAG, "Failed to send binary frame to client %d: %s", client_fd, esp_err_to_name(ret));
     }
     
-    return true;
+    return ret;
 }
 
-/**
- * @brief Periodic cleanup of stale client connections
- */
-void ws_cleanup_stale_clients(void) {
-    static uint32_t last_cleanup_time = 0;
-    uint32_t current_time = (uint32_t)(esp_timer_get_time() / 1000000); // Convert to seconds
-    
-    // Run cleanup every 30 seconds
-    if (current_time - last_cleanup_time < 30) {
-        return;
+esp_err_t websocket_send_fragmented_frame(int client_fd, const uint8_t *data, size_t len, uint8_t palette_index) {
+    if (!g_websocket_server.is_initialized || client_fd < 0 || !data || len == 0) {
+        return ESP_ERR_INVALID_ARG;
     }
     
-    last_cleanup_time = current_time;
-    
-    if (ws_client_count == 0) {
-        return;
-    }
-    
-    ESP_LOGD(TAG, "Running periodic client cleanup, checking %d clients", ws_client_count);
-    
-    int removed_count = 0;
-    for (int i = ws_client_count - 1; i >= 0; i--) {
-        if (ws_client_fds[i] >= 0) {
-            if (!ws_check_client_alive(ws_client_fds[i])) {
-                ESP_LOGW(TAG, "Removing stale client connection FD %d", ws_client_fds[i]);
-                ws_remove_client(ws_client_fds[i]);
-                removed_count++;
-            }
+    // For small frames, send directly
+    if (len <= FRAGMENT_SIZE) {
+        // Prepend palette index
+        uint8_t *frame_with_palette = malloc(len + 1);
+        if (!frame_with_palette) {
+            return ESP_ERR_NO_MEM;
         }
+        
+        frame_with_palette[0] = palette_index;
+        memcpy(frame_with_palette + 1, data, len);
+        
+        esp_err_t ret = websocket_send_binary_frame(client_fd, frame_with_palette, len + 1);
+        free(frame_with_palette);
+        return ret;
     }
     
-    if (removed_count > 0) {
-        ESP_LOGI(TAG, "Cleaned up %d stale client connections", removed_count);
+    // For large frames, use fragmentation
+    size_t offset = 0;
+    size_t chunk_size = FRAGMENT_SIZE - 1; // Leave room for palette index in first chunk
+    bool is_first_chunk = true;
+    bool is_last_chunk = false;
+    int chunk_count = 0;
+    
+    ESP_LOGI(TAG, "Starting fragmented transmission: %zu bytes, palette %d", len, palette_index);
+    
+    while (offset < len) {
+        size_t current_chunk_size = (offset + chunk_size > len) ? (len - offset) : chunk_size;
+        is_last_chunk = (offset + current_chunk_size >= len);
+        chunk_count++;
+        
+        // Allocate buffer for this chunk
+        size_t buffer_size = current_chunk_size + (is_first_chunk ? 1 : 0);
+        uint8_t *chunk_buffer = malloc(buffer_size);
+        if (!chunk_buffer) {
+            ESP_LOGE(TAG, "Failed to allocate chunk buffer");
+            return ESP_ERR_NO_MEM;
+        }
+        
+        // Create WebSocket frame
+        httpd_ws_frame_t ws_pkt;
+        memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+        ws_pkt.type = is_first_chunk ? HTTPD_WS_TYPE_BINARY : HTTPD_WS_TYPE_CONTINUE;
+        ws_pkt.final = is_last_chunk ? 1 : 0;
+        ws_pkt.fragmented = 1;
+        ws_pkt.payload = chunk_buffer;
+        
+        if (is_first_chunk) {
+            // First chunk: add palette index at the beginning
+            chunk_buffer[0] = palette_index;
+            memcpy(chunk_buffer + 1, data + offset, current_chunk_size);
+            ws_pkt.len = current_chunk_size + 1;
+            is_first_chunk = false;
+        } else {
+            // Subsequent chunks: send data directly
+            memcpy(chunk_buffer, data + offset, current_chunk_size);
+            ws_pkt.len = current_chunk_size;
+        }
+        
+        // Send the chunk
+        esp_err_t ret = httpd_ws_send_frame_async(g_websocket_server.server_handle, client_fd, &ws_pkt);
+        free(chunk_buffer);
+        
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to send chunk %d: %s", chunk_count, esp_err_to_name(ret));
+            return ret;
+        }
+        
+        // Small delay between chunks for reliability
+        if (!is_last_chunk) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        
+        offset += current_chunk_size;
     }
+    
+    ESP_LOGI(TAG, "Completed fragmented transmission: %zu bytes in %d chunks", len, chunk_count);
+    return ESP_OK;
 }
 
 /* ============================================================================
  * WEB PAGE INITIALIZATION
  * ============================================================================ */
 
-void init_web_page_buffer(void) {
+static esp_err_t load_static_files(void) {
     esp_vfs_spiffs_conf_t conf = {
         .base_path = "/spiffs",
         .partition_label = NULL,
@@ -305,57 +217,85 @@ void init_web_page_buffer(void) {
 
     ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
 
-    // Get file size first
-    struct stat st;
-    if (stat(INDEX_HTML_PATH, &st) != 0) {
-        ESP_LOGE(TAG, "index.html not found at %s", INDEX_HTML_PATH);
-        return;
-    }
-
-    // Allocate buffer in PSRAM
-    index_html = heap_caps_malloc(st.st_size + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!index_html) {
-        ESP_LOGE(TAG, "Failed to allocate index.html buffer in PSRAM");
-        return;
-    }
-
     // Load index.html
-    FILE *fp = fopen(INDEX_HTML_PATH, "r");
-    if (fp == NULL) {
-        ESP_LOGE(TAG, "Failed to open %s", INDEX_HTML_PATH);
-        free(index_html);
-        index_html = NULL;
-        return;
+    struct stat st;
+    if (stat(INDEX_HTML_PATH, &st) == 0) {
+        g_index_html = heap_caps_malloc(st.st_size + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (g_index_html) {
+            FILE *fp = fopen(INDEX_HTML_PATH, "r");
+            if (fp) {
+                if (fread(g_index_html, st.st_size, 1, fp) == 1) {
+                    g_index_html[st.st_size] = '\0';
+                    ESP_LOGI(TAG, "Loaded index.html (%ld bytes)", st.st_size);
+                } else {
+                    heap_caps_free(g_index_html);
+                    g_index_html = NULL;
+                }
+                fclose(fp);
+            } else {
+                heap_caps_free(g_index_html);
+                g_index_html = NULL;
+            }
+        }
     }
 
-    if (fread(index_html, st.st_size, 1, fp) == 0) {
-        ESP_LOGE(TAG, "Failed to read %s", INDEX_HTML_PATH);
-        free(index_html);
-        index_html = NULL;
-    } else {
-        index_html[st.st_size] = '\0'; // Ensure null termination
-        ESP_LOGI(TAG, "Loaded index.html (%ld bytes) to PSRAM", st.st_size);
+    // Load doom-palette.js
+    if (stat(DOOM_PALETTE_JS_PATH, &st) == 0) {
+        g_palette_js = heap_caps_malloc(st.st_size + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (g_palette_js) {
+            FILE *fp = fopen(DOOM_PALETTE_JS_PATH, "r");
+            if (fp) {
+                if (fread(g_palette_js, st.st_size, 1, fp) == 1) {
+                    g_palette_js[st.st_size] = '\0';
+                    ESP_LOGI(TAG, "Loaded doom-palette.js (%ld bytes)", st.st_size);
+                } else {
+                    heap_caps_free(g_palette_js);
+                    g_palette_js = NULL;
+                }
+                fclose(fp);
+            } else {
+                heap_caps_free(g_palette_js);
+                g_palette_js = NULL;
+            }
+        }
     }
-    
-    fclose(fp);
+
+    return ESP_OK;
 }
 
 /* ============================================================================
- * WEB SOCKET REQUEST HANDLING
+ * HTTP REQUEST HANDLERS
  * ============================================================================ */
 
-esp_err_t handle_ws_req(httpd_req_t *req) {
+esp_err_t websocket_index_handler(httpd_req_t *req) {
+    if (g_index_html) {
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req, g_index_html, strlen(g_index_html));
+    } else {
+        httpd_resp_send_404(req);
+    }
+    return ESP_OK;
+}
+
+esp_err_t websocket_palette_handler(httpd_req_t *req) {
+    if (g_palette_js) {
+        httpd_resp_set_type(req, "application/javascript");
+        httpd_resp_send(req, g_palette_js, strlen(g_palette_js));
+    } else {
+        httpd_resp_send_404(req);
+    }
+    return ESP_OK;
+}
+
+esp_err_t websocket_ws_handler(httpd_req_t *req) {
     // Handle WebSocket handshake
     if (req->method == HTTP_GET) {
         ESP_LOGI(TAG, "WebSocket handshake completed, new connection opened");
         
         // Add client to list
-        if (ws_client_count < MAX_WS_CLIENTS) {
-            ws_client_fds[ws_client_count] = httpd_req_to_sockfd(req);
-            ws_client_count++;
-            ESP_LOGI(TAG, "Client added, total clients: %d", ws_client_count);
-        } else {
-            ESP_LOGW(TAG, "Maximum number of clients reached, rejecting connection");
+        esp_err_t ret = websocket_add_client(httpd_req_to_sockfd(req));
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to add client to list");
         }
     }
 
@@ -364,24 +304,15 @@ esp_err_t handle_ws_req(httpd_req_t *req) {
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
     
-    // Enhanced error handling for frame reception
+    // Receive frame
     esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
     if (ret != ESP_OK) {
-        // Check if this is a client disconnection error
         if (ret == ESP_FAIL || ret == ESP_ERR_INVALID_ARG) {
-            ESP_LOGW(TAG, "Client appears to have disconnected during frame reception: %s", 
-                     esp_err_to_name(ret));
-            
-            // Remove client from list if it exists
-            int client_fd = httpd_req_to_sockfd(req);
-            ws_remove_client(client_fd);
-            
-            // Return success to prevent further error handling
+            ESP_LOGW(TAG, "Client disconnected during frame reception");
+            websocket_remove_client(httpd_req_to_sockfd(req));
             return ESP_OK;
         }
-        
-        ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame len: %s", 
-                 esp_err_to_name(ret));
+        ESP_LOGE(TAG, "httpd_ws_recv_frame failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
@@ -395,19 +326,12 @@ esp_err_t handle_ws_req(httpd_req_t *req) {
         ws_pkt.payload = buf;
         ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
         if (ret != ESP_OK) {
-            // Check if this is a client disconnection error
             if (ret == ESP_FAIL || ret == ESP_ERR_INVALID_ARG) {
-                ESP_LOGW(TAG, "Client disconnected during payload reception: %s", 
-                         esp_err_to_name(ret));
-                
-                // Remove client from list if it exists
-                int client_fd = httpd_req_to_sockfd(req);
-                ws_remove_client(client_fd);
-                
+                ESP_LOGW(TAG, "Client disconnected during payload reception");
+                websocket_remove_client(httpd_req_to_sockfd(req));
                 free(buf);
                 return ESP_OK;
             }
-            
             ESP_LOGE(TAG, "httpd_ws_recv_frame failed: %s", esp_err_to_name(ret));
             free(buf);
             return ret;
@@ -416,19 +340,9 @@ esp_err_t handle_ws_req(httpd_req_t *req) {
         ESP_LOGI(TAG, "Received WebSocket message: %s", ws_pkt.payload);
     }
 
-    ESP_LOGD(TAG, "WebSocket frame length: %d", ws_pkt.len);
-
-    // Handle toggle command
-    if (ws_pkt.type == HTTPD_WS_TYPE_TEXT &&
-        strcmp((char *)ws_pkt.payload, "toggle") == 0) {
-        free(buf);
-        return trigger_async_send(req->handle, req);
-    }
-    
     // Handle client disconnect
     if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
-        int client_fd = httpd_req_to_sockfd(req);
-        ws_remove_client(client_fd);
+        websocket_remove_client(httpd_req_to_sockfd(req));
         ESP_LOGI(TAG, "Client disconnected");
     }
     
@@ -443,128 +357,153 @@ esp_err_t handle_ws_req(httpd_req_t *req) {
  * WEB SERVER SETUP AND MANAGEMENT
  * ============================================================================ */
 
-httpd_handle_t setup_websocket_server(void) {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 8192;  // Increase stack size to prevent crashes
-    config.task_priority = 2;   // Lower priority than DOOM task
-    config.max_uri_handlers = 8; // Increase handler limit
-    config.max_resp_headers = 8; // Increase header limit
-    config.recv_wait_timeout = 10; // 10 second receive timeout
-    config.send_wait_timeout = 10; // 10 second send timeout
-    config.lru_purge_enable = true; // Enable LRU purge for better memory management
+esp_err_t websocket_server_init(void) {
+    if (g_websocket_server.is_initialized) {
+        return ESP_OK;
+    }
     
-    static httpd_handle_t server = NULL;
+    ESP_LOGI(TAG, "Initializing WebSocket server");
     
     // Initialize client file descriptors
-    init_client_fds();
+    for (int i = 0; i < MAX_WS_CLIENTS; i++) {
+        g_websocket_server.client_fds[i] = -1;
+    }
+    g_websocket_server.client_count = 0;
+    g_websocket_server.server_handle = NULL;
+    
+    // Load static files
+    esp_err_t ret = load_static_files();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to load static files, continuing anyway");
+    }
+    
+    g_websocket_server.is_initialized = true;
+    ESP_LOGI(TAG, "WebSocket server initialized");
+    
+    return ESP_OK;
+}
 
-    // Configure URI handlers
+esp_err_t websocket_server_start(void) {
+    if (!g_websocket_server.is_initialized) {
+        ESP_LOGE(TAG, "WebSocket server not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (g_websocket_server.server_handle) {
+        ESP_LOGW(TAG, "WebSocket server already running");
+        return ESP_OK;
+    }
+    
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
+    config.task_priority = 2;
+    config.max_uri_handlers = 8;
+    config.max_resp_headers = 8;
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
+    config.lru_purge_enable = true;
+    
+    esp_err_t ret = httpd_start(&g_websocket_server.server_handle, &config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start HTTP server: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Register URI handlers
     httpd_uri_t uri_get = {
         .uri = "/",
         .method = HTTP_GET,
-        .handler = index_handler,
+        .handler = websocket_index_handler,
         .user_ctx = NULL
     };
 
-    httpd_uri_t doom_palette_js_uri = {
+    httpd_uri_t palette_uri = {
         .uri = "/doom-palette.js",
         .method = HTTP_GET,
-        .handler = doom_palette_js_handler,
+        .handler = websocket_palette_handler,
         .user_ctx = NULL
     };
 
-    httpd_uri_t ws = {
+    httpd_uri_t ws_uri = {
         .uri = "/ws",
         .method = HTTP_GET,
-        .handler = handle_ws_req,
+        .handler = websocket_ws_handler,
         .user_ctx = NULL,
         .is_websocket = true
     };
 
-    esp_err_t ret = httpd_start(&server, &config);
-    if (ret == ESP_OK) {
-        ret = httpd_register_uri_handler(server, &uri_get);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to register index handler: %s", esp_err_to_name(ret));
-        }
-        
-        ret = httpd_register_uri_handler(server, &doom_palette_js_uri);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to register palette handler: %s", esp_err_to_name(ret));
-        }
-        
-        ret = httpd_register_uri_handler(server, &ws);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to register WebSocket handler: %s", esp_err_to_name(ret));
-        }
-        
-        g_server_handle = server; // Store global reference
-        ESP_LOGI(TAG, "WebSocket server started successfully");
-    } else {
-        ESP_LOGE(TAG, "Failed to start WebSocket server: %s", esp_err_to_name(ret));
-    }
-
-    return server;
-}
-
-esp_err_t stop_webserver(httpd_handle_t server) {
-    if (server) {
-        // Stop the httpd server
-        return httpd_stop(server);
-    }
-    return ESP_FAIL;
-}
-
-void cleanup_websocket_resources(void) {
-    ESP_LOGI(TAG, "Cleaning up WebSocket resources...");
-    
-    // Free web page buffer
-    if (index_html) {
-        heap_caps_free(index_html);
-        index_html = NULL;
+    ret = httpd_register_uri_handler(g_websocket_server.server_handle, &uri_get);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register index handler: %s", esp_err_to_name(ret));
     }
     
-    ESP_LOGI(TAG, "WebSocket resources cleaned up");
+    ret = httpd_register_uri_handler(g_websocket_server.server_handle, &palette_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register palette handler: %s", esp_err_to_name(ret));
+    }
+    
+    ret = httpd_register_uri_handler(g_websocket_server.server_handle, &ws_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register WebSocket handler: %s", esp_err_to_name(ret));
+    }
+    
+    ESP_LOGI(TAG, "WebSocket server started successfully");
+    return ESP_OK;
+}
+
+esp_err_t websocket_server_stop(void) {
+    if (g_websocket_server.server_handle) {
+        esp_err_t ret = httpd_stop(g_websocket_server.server_handle);
+        g_websocket_server.server_handle = NULL;
+        return ret;
+    }
+    return ESP_OK;
+}
+
+void websocket_server_cleanup(void) {
+    ESP_LOGI(TAG, "Cleaning up WebSocket server resources");
+    
+    websocket_server_stop();
+    
+    // Free static file buffers
+    if (g_index_html) {
+        heap_caps_free(g_index_html);
+        g_index_html = NULL;
+    }
+    
+    if (g_palette_js) {
+        heap_caps_free(g_palette_js);
+        g_palette_js = NULL;
+    }
+    
+    g_websocket_server.is_initialized = false;
+    ESP_LOGI(TAG, "WebSocket server resources cleaned up");
 }
 
 /* ============================================================================
  * NETWORK EVENT HANDLERS
  * ============================================================================ */
 
-/**
- * @brief Handle network disconnect events
- * @param arg Server handle pointer
- * @param event_base Event base
- * @param event_id Event ID
- * @param event_data Event data
- */
-void disconnect_handler(void* arg, esp_event_base_t event_base,
-                      int32_t event_id, void* event_data) {
-    httpd_handle_t* server = (httpd_handle_t*) arg;
-    if (*server) {
-        ESP_LOGI(TAG, "Network disconnected, stopping web server");
-        if (stop_webserver(*server) == ESP_OK) {
-            *server = NULL;
-            g_server_handle = NULL; // Clear global reference
-        } else {
-            ESP_LOGE(TAG, "Failed to stop web server");
-        }
-    }
+void websocket_connect_handler(void* arg, esp_event_base_t event_base,
+                             int32_t event_id, void* event_data) {
+    ESP_LOGI(TAG, "Network connected, starting WebSocket server");
+    websocket_server_start();
 }
 
-/**
- * @brief Handle network connect events
- * @param arg Server handle pointer
- * @param event_base Event base
- * @param event_id Event ID
- * @param event_data Event data
- */
-void connect_handler(void* arg, esp_event_base_t event_base,
-                    int32_t event_id, void* event_data) {
-    httpd_handle_t* server = (httpd_handle_t*) arg;
-    if (*server == NULL) {
-        ESP_LOGI(TAG, "Network connected, starting web server");
-        *server = setup_websocket_server();
-        g_server_handle = *server; // Update global reference
-    }
+void websocket_disconnect_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data) {
+    ESP_LOGI(TAG, "Network disconnected, stopping WebSocket server");
+    websocket_server_stop();
+}
+
+/* ============================================================================
+ * UTILITY FUNCTIONS
+ * ============================================================================ */
+
+bool websocket_server_is_ready(void) {
+    return g_websocket_server.is_initialized && g_websocket_server.server_handle != NULL;
+}
+
+httpd_handle_t websocket_get_server_handle(void) {
+    return g_websocket_server.server_handle;
 } 
