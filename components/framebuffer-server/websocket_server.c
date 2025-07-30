@@ -16,6 +16,8 @@
 #include <mbedtls/sha1.h>
 #include "websocket_server.h"
 #include "frame_queue.h"
+#include "ws_deflate.h"
+#include "miniz.h"
 
 #define TAG "ws_server"
 
@@ -193,12 +195,42 @@ static int websocket_handshake(int client_fd) {
     char accept_key[128];
     base64_sha1(client_key, accept_key, sizeof(accept_key));
 
+    // Parse extensions for permessage-deflate support
+    char extensions_response[256] = "";
+    const char *extensions_hdr = "Sec-WebSocket-Extensions: ";
+    char *extensions_ptr = strstr(buffer, extensions_hdr);
+    if (extensions_ptr) {
+        extensions_ptr += strlen(extensions_hdr);
+        char *eol = strstr(extensions_ptr, "\r\n");
+        if (eol) {
+            char extensions[256];
+            strncpy(extensions, extensions_ptr, eol - extensions_ptr);
+            extensions[eol - extensions_ptr] = 0;
+            
+#if WS_ENABLE_PERMESSAGE_DEFLATE
+            if (websocket_parse_deflate_extension(extensions, extensions_response, sizeof(extensions_response)) == 0) {
+                ESP_LOGI(TAG, "Permessage-deflate extension negotiated");
+            }
+#endif
+        }
+    }
+    
     char response[512];
-    snprintf(response, sizeof(response),
-             "HTTP/1.1 101 Switching Protocols\r\n"
-             "Upgrade: websocket\r\n"
-             "Connection: Upgrade\r\n"
-             "Sec-WebSocket-Accept: %s\r\n\r\n", accept_key);
+    if (strlen(extensions_response) > 0) {
+        snprintf(response, sizeof(response),
+                 "HTTP/1.1 101 Switching Protocols\r\n"
+                 "Upgrade: websocket\r\n"
+                 "Connection: Upgrade\r\n"
+                 "Sec-WebSocket-Accept: %s\r\n"
+                 "Sec-WebSocket-Extensions: %s\r\n\r\n", 
+                 accept_key, extensions_response);
+    } else {
+        snprintf(response, sizeof(response),
+                 "HTTP/1.1 101 Switching Protocols\r\n"
+                 "Upgrade: websocket\r\n"
+                 "Connection: Upgrade\r\n"
+                 "Sec-WebSocket-Accept: %s\r\n\r\n", accept_key);
+    }
 
     heap_caps_free(buffer);
     return nonblocking_send(client_fd, response, strlen(response), 5000);
@@ -206,15 +238,59 @@ static int websocket_handshake(int client_fd) {
 
 // Send WebSocket binary frame with non-blocking operations
 int websocket_send_binary_frame(int client_fd, const uint8_t *data, size_t len) {
+    // Find the client structure
+    websocket_client_t *client = NULL;
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (g_websocket_server.clients[i].fd == client_fd) {
+            client = &g_websocket_server.clients[i];
+            break;
+        }
+    }
+    
+    if (!client) {
+        ESP_LOGE(TAG, "Client not found for fd %d", client_fd);
+        return -1;
+    }
+    
+    const uint8_t *frame_data = data;
+    size_t frame_len = len;
+    uint8_t *compressed_data = NULL;
+    
+#if WS_ENABLE_PERMESSAGE_DEFLATE
+    // Compress data if compression is enabled
+    if (client->compression_enabled) {
+        compressed_data = heap_caps_malloc(WS_DEFLATE_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (compressed_data) {
+            size_t compressed_len = WS_DEFLATE_BUFFER_SIZE;
+            if (websocket_compress_frame(client, data, len, compressed_data, &compressed_len) == 0) {
+                // Use compressed data if it's smaller
+                if (compressed_len < len) {
+                    frame_data = compressed_data;
+                    frame_len = compressed_len;
+                    ESP_LOGI(TAG, "Using compressed frame: %zu -> %zu bytes", len, compressed_len);
+                } else {
+                    ESP_LOGI(TAG, "Compression not beneficial, using original frame");
+                    heap_caps_free(compressed_data);
+                    compressed_data = NULL;
+                }
+            } else {
+                ESP_LOGW(TAG, "Compression failed, using original frame");
+                heap_caps_free(compressed_data);
+                compressed_data = NULL;
+            }
+        }
+    }
+#endif
+    
     const size_t max_chunk_size = 16384; // 16KB per fragment
     size_t offset = 0;
     int fragment_count = 0;
     
-    ESP_LOGI(TAG, "Sending WebSocket binary frame in fragments: total_size=%zu", len);
+    //ESP_LOGI(TAG, "Sending WebSocket binary frame in fragments: total_size=%zu", len);
     
-    while (offset < len) {
-        size_t chunk_size = (len - offset < max_chunk_size) ? (len - offset) : max_chunk_size;
-        bool is_last = (offset + chunk_size >= len);
+    while (offset < frame_len) {
+        size_t chunk_size = (frame_len - offset < max_chunk_size) ? (frame_len - offset) : max_chunk_size;
+        bool is_last = (offset + chunk_size >= frame_len);
         
         uint8_t header[10];
         size_t header_len = 0;
@@ -242,18 +318,24 @@ int websocket_send_binary_frame(int client_fd, const uint8_t *data, size_t len) 
             header_len = 10;
         }
         
-        ESP_LOGI(TAG, "Sending fragment %d: offset=%zu, size=%zu, is_last=%d", 
-                 fragment_count, offset, chunk_size, is_last);
+        //ESP_LOGI(TAG, "Sending fragment %d: offset=%zu, size=%zu, is_last=%d", 
+        //         fragment_count, offset, chunk_size, is_last);
         
         // Send header with non-blocking operation
         if (nonblocking_send(client_fd, header, header_len, 1000) < 0) {
             ESP_LOGE(TAG, "Failed to send WebSocket fragment header");
+            if (compressed_data) {
+                heap_caps_free(compressed_data);
+            }
             return -1;
         }
         
         // Send fragment data with non-blocking operation
-        if (nonblocking_send(client_fd, data + offset, chunk_size, 1000) < 0) {
+        if (nonblocking_send(client_fd, frame_data + offset, chunk_size, 1000) < 0) {
             ESP_LOGE(TAG, "Failed to send WebSocket fragment data");
+            if (compressed_data) {
+                heap_caps_free(compressed_data);
+            }
             return -1;
         }
         
@@ -261,13 +343,18 @@ int websocket_send_binary_frame(int client_fd, const uint8_t *data, size_t len) 
         fragment_count++;
         
         // Small delay between chunks to allow lwIP to process
-        if (offset < len) {
+        if (offset < frame_len) {
             vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
     
-    ESP_LOGI(TAG, "WebSocket fragmentation complete: %d fragments sent, total=%zu bytes", 
-             fragment_count, len);
+    // Clean up compressed data
+    if (compressed_data) {
+        heap_caps_free(compressed_data);
+    }
+    
+    //ESP_LOGI(TAG, "WebSocket fragmentation complete: %d fragments sent, total=%zu bytes", 
+    //         fragment_count, len);
     return 0;
 }
 
@@ -294,7 +381,7 @@ int websocket_send_text_frame(int client_fd, const char *text) {
         header_len = 10;
     }
 
-    ESP_LOGI(TAG, "Sending WebSocket text frame: size=%zu", len);
+    //ESP_LOGI(TAG, "Sending WebSocket text frame: size=%zu", len);
     
     if (nonblocking_send(client_fd, header, header_len, 1000) < 0) {
         ESP_LOGE(TAG, "Failed to send text frame header");
@@ -306,7 +393,7 @@ int websocket_send_text_frame(int client_fd, const char *text) {
         return -1;
     }
     
-    ESP_LOGI(TAG, "WebSocket text frame sent successfully: %zu bytes", len);
+    //ESP_LOGI(TAG, "WebSocket text frame sent successfully: %zu bytes", len);
     return 0;
 }
 
@@ -333,6 +420,198 @@ int websocket_send_close(int client_fd, uint16_t code) {
     ESP_LOGI(TAG, "WebSocket close frame sent successfully with code: %d", code);
     return 0;
 }
+
+#if WS_ENABLE_PERMESSAGE_DEFLATE
+
+// Parse permessage-deflate extension in WebSocket handshake
+int websocket_parse_deflate_extension(const char *extensions, char *response, size_t response_len) {
+    if (!extensions || !response) {
+        return -1;
+    }
+    
+    // Look for permessage-deflate extension
+    if (strstr(extensions, "permessage-deflate") != NULL) {
+        ESP_LOGI(TAG, "Client supports permessage-deflate extension");
+        
+        // Parse parameters
+        const char *server_no_context_takeover = strstr(extensions, "server_no_context_takeover");
+        const char *client_no_context_takeover = strstr(extensions, "client_no_context_takeover");
+        (void)strstr(extensions, "server_max_window_bits"); // Suppress unused variable warning
+        (void)strstr(extensions, "client_max_window_bits"); // Suppress unused variable warning
+        
+        // Build response
+        snprintf(response, response_len, "permessage-deflate");
+        
+        if (server_no_context_takeover) {
+            strncat(response, "; server_no_context_takeover", response_len - strlen(response) - 1);
+        }
+        
+        if (client_no_context_takeover) {
+            strncat(response, "; client_no_context_takeover", response_len - strlen(response) - 1);
+        }
+        
+        ESP_LOGI(TAG, "Permessage-deflate response: %s", response);
+        return 0;
+    }
+    
+    return -1;
+}
+
+// Initialize compression for a client
+int websocket_init_compression(websocket_client_t *client) {
+    if (!client) {
+        return -1;
+    }
+    
+    // Allocate compression buffers in PSRAM
+    client->deflate_buffer_size = WS_DEFLATE_BUFFER_SIZE;
+    client->deflate_buffer = heap_caps_malloc(client->deflate_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!client->deflate_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate deflate buffer");
+        return -1;
+    }
+    
+    client->inflate_buffer_size = WS_DEFLATE_BUFFER_SIZE;
+    client->inflate_buffer = heap_caps_malloc(client->inflate_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!client->inflate_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate inflate buffer");
+        heap_caps_free(client->deflate_buffer);
+        client->deflate_buffer = NULL;
+        return -1;
+    }
+    
+    // Allocate stream contexts in PSRAM
+    client->deflate_stream = heap_caps_malloc(sizeof(mz_stream), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!client->deflate_stream) {
+        ESP_LOGE(TAG, "Failed to allocate deflate stream");
+        heap_caps_free(client->deflate_buffer);
+        heap_caps_free(client->inflate_buffer);
+        client->deflate_buffer = NULL;
+        client->inflate_buffer = NULL;
+        return -1;
+    }
+    
+    client->inflate_stream = heap_caps_malloc(sizeof(mz_stream), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!client->inflate_stream) {
+        ESP_LOGE(TAG, "Failed to allocate inflate stream");
+        heap_caps_free(client->deflate_buffer);
+        heap_caps_free(client->inflate_buffer);
+        heap_caps_free(client->deflate_stream);
+        client->deflate_buffer = NULL;
+        client->inflate_buffer = NULL;
+        client->deflate_stream = NULL;
+        return -1;
+    }
+    
+    // Initialize stream contexts
+    memset(client->deflate_stream, 0, sizeof(mz_stream));
+    memset(client->inflate_stream, 0, sizeof(mz_stream));
+    
+    int deflate_result = mz_deflateInit2(client->deflate_stream, MZ_DEFAULT_COMPRESSION, MZ_DEFLATED, -15, 8, MZ_DEFAULT_STRATEGY);
+    if (deflate_result != MZ_OK) {
+        ESP_LOGE(TAG, "Failed to initialize deflate stream: %d", deflate_result);
+        websocket_cleanup_compression(client);
+        return -1;
+    }
+    
+    int inflate_result = mz_inflateInit2(client->inflate_stream, -15);
+    if (inflate_result != MZ_OK) {
+        ESP_LOGE(TAG, "Failed to initialize inflate stream: %d", inflate_result);
+        websocket_cleanup_compression(client);
+        return -1;
+    }
+    
+    client->compression_enabled = 1;
+    ESP_LOGI(TAG, "Compression initialized for client");
+    return 0;
+}
+
+// Cleanup compression for a client
+void websocket_cleanup_compression(websocket_client_t *client) {
+    if (!client) {
+        return;
+    }
+    
+    if (client->deflate_stream) {
+        mz_deflateEnd(client->deflate_stream);
+        heap_caps_free(client->deflate_stream);
+        client->deflate_stream = NULL;
+    }
+    
+    if (client->inflate_stream) {
+        mz_inflateEnd(client->inflate_stream);
+        heap_caps_free(client->inflate_stream);
+        client->inflate_stream = NULL;
+    }
+    
+    if (client->deflate_buffer) {
+        heap_caps_free(client->deflate_buffer);
+        client->deflate_buffer = NULL;
+    }
+    
+    if (client->inflate_buffer) {
+        heap_caps_free(client->inflate_buffer);
+        client->inflate_buffer = NULL;
+    }
+    
+    client->compression_enabled = 0;
+    client->deflate_buffer_size = 0;
+    client->inflate_buffer_size = 0;
+    
+    ESP_LOGI(TAG, "Compression cleaned up for client");
+}
+
+// Compress a frame using deflate
+int websocket_compress_frame(websocket_client_t *client, const uint8_t *input, size_t input_len, 
+                           uint8_t *output, size_t *output_len) {
+    if (!client || !client->compression_enabled || !client->deflate_buffer || !client->deflate_stream) {
+        return -1;
+    }
+    
+    // Use the ws_deflate implementation which properly handles RFC 7692
+    size_t compressed_len = *output_len;
+    int result = ws_deflate_compress(input, input_len, client->deflate_buffer, &compressed_len, client->deflate_stream);
+    
+    if (result == 0) {
+        // Only use compression if it actually reduces the size
+        if (compressed_len < input_len) {
+            memcpy(output, client->deflate_buffer, compressed_len);
+            *output_len = compressed_len;
+            ESP_LOGI(TAG, "Compressed frame: %zu -> %zu bytes (RFC 7692 compliant)", input_len, *output_len);
+            return 0;
+        } else {
+            ESP_LOGW(TAG, "Compression not beneficial: %zu -> %zu bytes, using original", input_len, compressed_len);
+            return -1; // Signal to use original data
+        }
+    } else {
+        ESP_LOGE(TAG, "Deflate compression failed: %d", result);
+        return -1;
+    }
+}
+
+// Decompress a frame using inflate
+int websocket_decompress_frame(websocket_client_t *client, const uint8_t *input, size_t input_len, 
+                             uint8_t *output, size_t *output_len) {
+    if (!client || !client->compression_enabled || !client->inflate_buffer || !client->inflate_stream) {
+        return -1;
+    }
+    
+    // Use the ws_deflate implementation which properly handles RFC 7692
+    size_t decompressed_len = *output_len;
+    int result = ws_deflate_decompress(input, input_len, client->inflate_buffer, &decompressed_len, client->inflate_stream);
+    
+    if (result == 0) {
+        memcpy(output, client->inflate_buffer, decompressed_len);
+        *output_len = decompressed_len;
+        ESP_LOGI(TAG, "Decompressed frame: %zu -> %zu bytes (RFC 7692 compliant)", input_len, *output_len);
+        return 0;
+    } else {
+        ESP_LOGE(TAG, "Inflate decompression failed: %d", result);
+        return -1;
+    }
+}
+
+#endif
 
 // Handle incoming WebSocket frames with non-blocking operations
 static int handle_ws_frame(int client_fd) {
@@ -393,7 +672,13 @@ void websocket_server_init(websocket_server_t *server) {
     memset(server, 0, sizeof(*server));
     server->server_fd = -1;
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        server->client_fds[i] = -1;
+        server->clients[i].fd = -1;
+        server->clients[i].active = 0;
+        server->clients[i].compression_enabled = 0;
+        server->clients[i].deflate_buffer = NULL;
+        server->clients[i].inflate_buffer = NULL;
+        server->clients[i].deflate_buffer_size = 0;
+        server->clients[i].inflate_buffer_size = 0;
     }
 }
 
@@ -442,9 +727,14 @@ void websocket_server_stop(websocket_server_t *server) {
     
     // Close all client connections
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (server->client_fds[i] >= 0) {
-            close(server->client_fds[i]);
-            server->client_fds[i] = -1;
+        if (server->clients[i].fd >= 0) {
+#if WS_ENABLE_PERMESSAGE_DEFLATE
+            // Cleanup compression
+            websocket_cleanup_compression(&server->clients[i]);
+#endif
+            close(server->clients[i].fd);
+            server->clients[i].fd = -1;
+            server->clients[i].active = 0;
         }
     }
     server->client_count = 0;
@@ -502,9 +792,20 @@ void websocket_server_task(void *pv) {
 
             // Add client to list
             for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-                if (server->client_fds[i] == -1) {
-                    server->client_fds[i] = client_fd;
+                if (server->clients[i].fd == -1) {
+                    server->clients[i].fd = client_fd;
+                    server->clients[i].active = 1;
                     server->client_count++;
+                    
+#if WS_ENABLE_PERMESSAGE_DEFLATE
+                    // Initialize compression if supported
+                    if (websocket_init_compression(&server->clients[i]) == 0) {
+                        ESP_LOGI(TAG, "Compression initialized for client %d", i);
+                    } else {
+                        ESP_LOGW(TAG, "Failed to initialize compression for client %d", i);
+                    }
+#endif
+                    
                     break;
                 }
             }
@@ -516,13 +817,20 @@ void websocket_server_task(void *pv) {
 
         // Handle existing client connections
         for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-            if (server->client_fds[i] >= 0) {
+            if (server->clients[i].fd >= 0 && server->clients[i].active) {
                 // Handle incoming frames
-                int result = handle_ws_frame(server->client_fds[i]);
+                int result = handle_ws_frame(server->clients[i].fd);
                 if (result < 0) {
                     ESP_LOGI(TAG, "Client disconnected (frame handling failed)");
-                    close(server->client_fds[i]);
-                    server->client_fds[i] = -1;
+                    
+#if WS_ENABLE_PERMESSAGE_DEFLATE
+                    // Cleanup compression
+                    websocket_cleanup_compression(&server->clients[i]);
+#endif
+                    
+                    close(server->clients[i].fd);
+                    server->clients[i].fd = -1;
+                    server->clients[i].active = 0;
                     server->client_count--;
                     continue;
                 } else if (result > 0) {
@@ -536,12 +844,19 @@ void websocket_server_task(void *pv) {
         if (frame && server->client_count > 0) {
             ESP_LOGI(TAG, "Sending frame of size %zu bytes to %d clients", (size_t)(FRAME_SIZE + 1), server->client_count);
             for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-                if (server->client_fds[i] >= 0) {
+                if (server->clients[i].fd >= 0 && server->clients[i].active) {
                     ESP_LOGI(TAG, "Sending frame to client %d, palette index: %d", i, frame[0]);
-                    if (websocket_send_binary_frame(server->client_fds[i], frame, FRAME_SIZE + 1) < 0) {
+                    if (websocket_send_binary_frame(server->clients[i].fd, frame, FRAME_SIZE + 1) < 0) {
                         ESP_LOGW(TAG, "Failed to send frame to client %d", i);
-                        close(server->client_fds[i]);
-                        server->client_fds[i] = -1;
+                        
+#if WS_ENABLE_PERMESSAGE_DEFLATE
+                        // Cleanup compression
+                        websocket_cleanup_compression(&server->clients[i]);
+#endif
+                        
+                        close(server->clients[i].fd);
+                        server->clients[i].fd = -1;
+                        server->clients[i].active = 0;
                         server->client_count--;
                     } else {
                         ESP_LOGI(TAG, "Frame sent successfully to client %d", i);
@@ -557,10 +872,10 @@ void websocket_server_task(void *pv) {
         // Send ping to keep connection alive
         static int ping_counter = 0;
         ping_counter++;
-        if (ping_counter >= 1000) { // Send ping every ~1 seconds
+        if (ping_counter >= 5000) { // Send ping every ~5 seconds
             for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-                if (server->client_fds[i] >= 0) {
-                    websocket_send_ping(server->client_fds[i]);
+                if (server->clients[i].fd >= 0 && server->clients[i].active) {
+                    websocket_send_ping(server->clients[i].fd);
                 }
             }
             ping_counter = 0;
