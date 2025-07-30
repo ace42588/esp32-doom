@@ -1,10 +1,5 @@
-idf_component_register(SRCS "main.c"
-                     "delta_encoding.c"
-                     "http_handlers.c"
-                     "network_transmission.c"
-                     "websocket_server.c"
-                     "frame_broadcaster.c"
-                    PRIV_REQUIRES esp_http_server esp_wifi nvs_flash spiffs esp_eth fatfs prboom prboom-esp32-compat esp_timer esp_psram
+idf_component_register(SRCS "server_integration.c" "http_handlers.c" "main.c"
+                    PRIV_REQUIRES esp_wifi nvs_flash spiffs esp_eth fatfs prboom prboom-esp32-compat esp_timer esp_psram framebuffer-server esp_http_server
                     INCLUDE_DIRS include)
 
 # Flash the WAD file to the wad partition

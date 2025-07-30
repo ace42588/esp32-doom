@@ -6,44 +6,29 @@
  */
 
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h> 
-#include <stdbool.h>
-#include <sys/stat.h>
 
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
-#include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_err.h"
-#include "esp_timer.h"
 #include "nvs_flash.h"
-#include "esp_spiffs.h"
 #include "esp_task_wdt.h"
 #include "esp_psram.h"
 
 // FreeRTOS includes
-#include "freertos/semphr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
-#include <sys/socket.h>
-#include <sys/time.h>
 
 #include "protocol_examples_common.h"
 #include "i_system.h"
-#include "websocket_server.h"
+#include "server_integration.h"
 #include "esp_heap_caps.h"
-
-// Include refactored modules
-#include "websocket_server.h"
-#include "network_transmission.h"
-#include "delta_encoding.h"
-#include "http_handlers.h"
 
 #define DOOM_TASK_CORE 1         // Core 0 = WiFi, Core 1 = Doom
 #define DOOM_TASK_STACK_SIZE 32768  // 32KB is the absolute minimum
+#define SERVER_TASK_STACK_SIZE 8192
+#define SERVER_TASK_PRIORITY 2
 
 static const char *TAG = "Main Application";
 
@@ -91,18 +76,6 @@ void app_main(void) {
     // Disable WiFi power management to prevent crashes
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    // Initialize WebSocket server (but don't start it yet)
-    ESP_ERROR_CHECK(websocket_server_init());
-
-    // Initialize network transmission
-    ESP_ERROR_CHECK(network_transmission_init());
-
-    // Register network event handlers
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, 
-                                             &websocket_connect_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, 
-                                             &websocket_disconnect_handler, NULL));
-    
     // Start Doom game task after all initialization is complete
     ESP_LOGI(TAG, "Creating DOOM task...");
     
@@ -133,6 +106,16 @@ void app_main(void) {
         } else {
             ESP_LOGE(TAG, "Error: Unknown error code %d", task_created);
         }
+        return;
+    }
+    
+    // Start server integration task (handles both HTTP and WebSocket)
+    ESP_LOGI(TAG, "Creating server integration task...");
+    BaseType_t server_task_created = xTaskCreate(&server_integration_task, "server_integration", SERVER_TASK_STACK_SIZE, NULL, SERVER_TASK_PRIORITY, NULL);
+    if (server_task_created == pdPASS) {
+        ESP_LOGI(TAG, "Server integration task created successfully");
+    } else {
+        ESP_LOGE(TAG, "Failed to create server integration task");
         return;
     }
 }

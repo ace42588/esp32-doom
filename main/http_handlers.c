@@ -121,6 +121,19 @@ esp_err_t http_ws_handler(httpd_req_t *req) {
  * UTILITY FUNCTIONS
  * ============================================================================ */
 
+// Allocate buffer in PSRAM with fallback to internal memory
+void* http_alloc_psram_buffer(size_t size) {
+    void *buffer = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buffer == NULL) {
+        ESP_LOGW(TAG, "Failed to allocate %zu bytes in PSRAM, falling back to internal memory", size);
+        buffer = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+        if (buffer == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate %zu bytes in any memory", size);
+        }
+    }
+    return buffer;
+}
+
 const char* http_get_content_type(const char *filename) {
     if (strstr(filename, ".html")) {
         return "text/html";

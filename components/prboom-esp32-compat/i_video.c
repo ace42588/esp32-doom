@@ -53,16 +53,14 @@
 
 #include "esp_task.h"
 #include "esp_heap_caps.h"
-
-#include "frame_broadcaster.h"
+#include "frame_queue.h"
 
 int use_doublebuffer = 0;
 int use_fullscreen = 0;
 int desired_fullscreen = 0;
 
-portMUX_TYPE myMutex = portMUX_INITIALIZER_UNLOCKED;
+extern frame_queue_t g_frame_queue;
 
-// Global framebuffer variables
 unsigned char *screenbuf;
 static uint8_t current_palette = 0;
 
@@ -97,8 +95,6 @@ void I_UpdateNoBlit (void)
  */
 void I_StartFrame (void)
 {
-  // Broadcast the previous frame while the current frame is being rendered
-  broadcast_framebuffer(screenbuf, SCREENWIDTH*SCREENHEIGHT, current_palette);
 }
 
 
@@ -118,12 +114,19 @@ void I_EndDisplay(void)
 void I_FinishUpdate (void)
 {
     uint8_t *scr=(uint8_t*)screens[0].data;
+
+    uint8_t *buf = frame_queue_get_write_buffer(&g_frame_queue);
+    if (!buf) {
+        // Queue is full — drop frame
+        return;
+    }
     
-    // Copy current frame to backup buffer
-    // Use a critical section to prevent concurrent access
-    taskENTER_CRITICAL(&myMutex);
-    memcpy(screenbuf, scr, SCREENWIDTH*SCREENHEIGHT);
-    taskEXIT_CRITICAL(&myMutex);
+    // Set palette index at position 0
+    buf[0] = current_palette;
+    
+    // Copy current frame to backup buffer (starting at position 1)
+    memcpy(buf + 1, scr, SCREENWIDTH*SCREENHEIGHT);
+    frame_queue_submit_frame(&g_frame_queue);
 }
 
 void I_SetPalette (int pal)

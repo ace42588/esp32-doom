@@ -17,90 +17,17 @@
     const WIDTH = 320;
     const HEIGHT = 240;
     const BYTES_PER_PIXEL = 1; // 8bpp indexed color
+    const EXPECTED_FRAME_SIZE = WIDTH * HEIGHT * BYTES_PER_PIXEL + 1; // +1 for palette index
+    
     const canvas = document.getElementById('fb');
     const ctx = canvas.getContext('2d');
     const imageData = ctx.createImageData(WIDTH, HEIGHT);
     
-    // Delta encoding configuration
-    const ENABLE_DELTA_ENCODING = false;  // Set to false to disable, true to enable
-    
-    // Compression configuration
-    const ENABLE_COMPRESSION = true;  // Set to false to disable compression support
-    
-    // Local framebuffer to store current frame state for delta encoding
+    // Local framebuffer to store current frame state
     const framebuffer = new Uint8Array(WIDTH * HEIGHT * BYTES_PER_PIXEL);
 
-    // Compression algorithm types (must match ESP32 side)
-    const COMPRESSION_NONE = 0;
-    const COMPRESSION_RLE = 1;
-    const COMPRESSION_LZ4 = 2;
-    const COMPRESSION_HEATSHRINK = 3;
-    const COMPRESSION_ZLIB = 4;
-
-    // Decompression functions
-    function decompressLZ4Optimized(input) {
-        const output = [];
-        let i = 0;
-        
-        while (i < input.length) {
-            const byte = input[i];
-            if ((byte & 0x80) !== 0) {
-                // Match marker found
-                const matchLen = byte & 0x7F;
-                
-                // Sanity check: don't allow excessive match length
-                if (matchLen > 255 || output.length + matchLen > 76800) {
-                    console.warn('LZ4 decompression: excessive match length, treating as literal');
-                    output.push(byte);
-                    i++;
-                    continue;
-                }
-                
-                if (i + 2 < input.length) {
-                    const matchPos = (input[i + 1] << 8) | input[i + 2];
-                    
-                    // Sanity check: match position should be within output
-                    if (matchPos >= output.length) {
-                        console.warn('LZ4 decompression: invalid match position, treating as literal');
-                        output.push(byte);
-                        i++;
-                        continue;
-                    }
-                    
-                    // Copy from previous data
-                    for (let j = 0; j < matchLen; j++) {
-                        if (matchPos + j < output.length) {
-                            output.push(output[matchPos + j]);
-                        }
-                    }
-                    i += 3;
-                } else {
-                    // Incomplete match, treat as literal
-                    output.push(byte);
-                    i++;
-                }
-            } else {
-                // Literal byte
-                output.push(byte);
-                i++;
-            }
-        }
-        
-        return new Uint8Array(output);
-    }
-
-    function decompressFrameData(input, algorithm) {
-        switch (algorithm) {
-            case COMPRESSION_LZ4:
-                return decompressLZ4Optimized(input);
-            case COMPRESSION_NONE:
-            default:
-                return input; // No compression
-        }
-    }
-
-    // Connect to the ESP32 WebSocket server on the same port as the HTTP server
-    const ws = new WebSocket('ws://' + location.hostname + ':80/ws');
+    // Connect to the ESP32 WebSocket server on port 8080
+    const ws = new WebSocket('ws://' + location.hostname + ':8080');
 
     ws.binaryType = 'arraybuffer';
 
@@ -115,193 +42,39 @@
         // Debug: Log received data details
         console.log('Received WebSocket data:', {
           size: data.length,
-          firstByte: data[0],
-          lastByte: data[data.length - 1],
-          paletteIndex: data[0]  // Palette index is now at the beginning
+          expectedSize: EXPECTED_FRAME_SIZE,
+          paletteIndex: data[0]
         });
         
-        // Check for compression markers and decompress if needed
-        let compressionUsed = false;
-        let decompressedData = data;
-        
-        if (ENABLE_COMPRESSION && data.length > 1) {
-            const firstByte = data[0];
-            let algorithm = COMPRESSION_NONE;
-            
-            // Check for LZ4 compression marker (excluding palette index)
-            if ((firstByte & 0x80) !== 0) {
-                // This might be compressed data
-                const compressedData = data.slice(1); // Remove palette index for decompression
-                algorithm = COMPRESSION_LZ4;
-                
-                try {
-                    const decompressed = decompressFrameData(compressedData, algorithm);
-                    
-                    // Validate decompressed size
-                    if (decompressed.length > 76800) {
-                        console.warn('Decompressed data too large:', decompressed.length, 'bytes, using original data');
-                        decompressedData = data;
-                    } else {
-                        // Reconstruct frame with palette index
-                        decompressedData = new Uint8Array(decompressed.length + 1);
-                        decompressedData[0] = data[0]; // Palette index
-                        decompressedData.set(decompressed, 1); // Decompressed data
-                        
-                        compressionUsed = true;
-                        console.log('Decompressed frame:', {
-                            originalSize: data.length,
-                            decompressedSize: decompressedData.length,
-                            algorithm: 'LZ4'
-                        });
-                    }
-                } catch (error) {
-                    console.warn('Decompression failed, using original data:', error);
-                    decompressedData = data;
-                }
-            }
-        }
-        
-        if (ENABLE_DELTA_ENCODING) {
-          // Check if this is a delta frame (smaller than full framebuffer)
-          if (decompressedData.length < WIDTH * HEIGHT * BYTES_PER_PIXEL + 1) {
-            // This is a delta frame - apply changes to current framebuffer
-            const paletteIndex = decompressedData[0]; // First byte is palette index
-            const deltaData = decompressedData.slice(1); // All but first byte is delta data
-            
-            console.log('Processing delta frame:', {
-              deltaSize: deltaData.length,
-              paletteIndex: paletteIndex,
-              compressed: compressionUsed
-            });
-            
-            // Apply delta changes to framebuffer
-            for (let i = 0; i < deltaData.length; i += 3) {
-              if (i + 2 < deltaData.length) {
-                const pos = (deltaData[i] << 8) | deltaData[i + 1]; // 16-bit position
-                const pixel = deltaData[i + 2]; // New pixel value
-                
-                if (pos < framebuffer.length) {
-                  framebuffer[pos] = pixel;
-                } else {
-                  console.warn('Delta position out of bounds:', pos, '>=', framebuffer.length);
-                }
-              }
-            }
-            
-            // Convert 8bpp indexed color to RGBA using DOOM palette
-            for (let i = 0; i < framebuffer.length; i++) {
-              const pixel = framebuffer[i];
-              const idx = i * 4;
-              // Calculate palette offset: paletteIndex * 256 entries * 3 RGB values
-              const paletteOffset = paletteIndex * 256 * 3;
-              const colorIdx = paletteOffset + pixel * 3;
-              // Use DOOM palette colors from the specified palette
-              imageData.data[idx] = doomColors[colorIdx];     // R
-              imageData.data[idx + 1] = doomColors[colorIdx + 1]; // G
-              imageData.data[idx + 2] = doomColors[colorIdx + 2]; // B
-              imageData.data[idx + 3] = 255;   // A
-            }
-            ctx.putImageData(imageData, 0, 0);
-          } else if (decompressedData.length === WIDTH * HEIGHT * BYTES_PER_PIXEL + 1) {
-            // This is a full framebuffer message with palette index
-            const paletteIndex = decompressedData[0]; // First byte is palette index
-            const framebufferData = decompressedData.slice(1); // All but first byte is framebuffer data
-            
-            console.log('Processing full frame:', {
-              frameSize: framebufferData.length,
-              paletteIndex: paletteIndex,
-              compressed: compressionUsed
-            });
-            
-            // Update our local framebuffer copy
-            framebuffer.set(framebufferData);
-            
-            // Convert 8bpp indexed color to RGBA using DOOM palette
-            for (let i = 0; i < framebuffer.length; i++) {
-              const pixel = framebuffer[i];
-              const idx = i * 4;
-              // Calculate palette offset: paletteIndex * 256 entries * 3 RGB values
-              const paletteOffset = paletteIndex * 256 * 3;
-              const colorIdx = paletteOffset + pixel * 3;
-              // Use DOOM palette colors from the specified palette
-              imageData.data[idx] = doomColors[colorIdx];     // R
-              imageData.data[idx + 1] = doomColors[colorIdx + 1]; // G
-              imageData.data[idx + 2] = doomColors[colorIdx + 2]; // B
-              imageData.data[idx + 3] = 255;   // A
-            }
-            ctx.putImageData(imageData, 0, 0);
-          } else {
-            // Handle other frame sizes (compressed frames, partial frames, etc.)
-            console.log('Processing frame of size:', decompressedData.length, 'bytes');
-            
-            if (decompressedData.length > 1) {
-              const paletteIndex = decompressedData[0]; // First byte is palette index
-              const frameData = decompressedData.slice(1); // All but first byte is frame data
-              
-              // For now, just log the frame info
-              console.log('Frame info:', {
-                size: frameData.length,
-                paletteIndex: paletteIndex,
-                compressed: compressionUsed,
-                expectedSize: WIDTH * HEIGHT * BYTES_PER_PIXEL
-              });
-              
-              // TODO: Implement proper handling for compressed/partial frames
-              // For now, we'll just update the display with whatever data we have
-              if (frameData.length <= framebuffer.length) {
-                // Copy available data to framebuffer
-                framebuffer.set(frameData);
-                
-                // Convert 8bpp indexed color to RGBA using DOOM palette
-                for (let i = 0; i < framebuffer.length; i++) {
-                  const pixel = framebuffer[i];
-                  const idx = i * 4;
-                  // Calculate palette offset: paletteIndex * 256 entries * 3 RGB values
-                  const paletteOffset = paletteIndex * 256 * 3;
-                  const colorIdx = paletteOffset + pixel * 3;
-                  // Use DOOM palette colors from the specified palette
-                  imageData.data[idx] = doomColors[colorIdx];     // R
-                  imageData.data[idx + 1] = doomColors[colorIdx + 1]; // G
-                  imageData.data[idx + 2] = doomColors[colorIdx + 2]; // B
-                  imageData.data[idx + 3] = 255;   // A
-                }
-                ctx.putImageData(imageData, 0, 0);
-              }
-            }
+        // Check if we received a complete frame
+        if (data.length === EXPECTED_FRAME_SIZE) {
+          const paletteIndex = data[0]; // First byte is palette index
+          const framebufferData = data.slice(1); // All but first byte is framebuffer data
+          
+          console.log('Processing frame:', {
+            frameSize: framebufferData.length,
+            paletteIndex: paletteIndex
+          });
+          
+          // Update our local framebuffer copy
+          framebuffer.set(framebufferData);
+          
+          // Convert 8bpp indexed color to RGBA using DOOM palette
+          for (let i = 0; i < framebuffer.length; i++) {
+            const pixel = framebuffer[i];
+            const idx = i * 4;
+            // Calculate palette offset: paletteIndex * 256 entries * 3 RGB values
+            const paletteOffset = paletteIndex * 256 * 3;
+            const colorIdx = paletteOffset + pixel * 3;
+            // Use DOOM palette colors from the specified palette
+            imageData.data[idx] = doomColors[colorIdx];     // R
+            imageData.data[idx + 1] = doomColors[colorIdx + 1]; // G
+            imageData.data[idx + 2] = doomColors[colorIdx + 2]; // B
+            imageData.data[idx + 3] = 255;   // A
           }
+          ctx.putImageData(imageData, 0, 0);
         } else {
-          // Delta encoding disabled - only handle full frames
-          if (decompressedData.length === WIDTH * HEIGHT * BYTES_PER_PIXEL + 1) {
-            // This is a full framebuffer message with palette index
-            const paletteIndex = decompressedData[0]; // First byte is palette index
-            const framebufferData = decompressedData.slice(1); // All but first byte is framebuffer data
-            
-            console.log('Processing full frame (delta disabled):', {
-              frameSize: framebufferData.length,
-              paletteIndex: paletteIndex,
-              compressed: compressionUsed
-            });
-            
-            // Update our local framebuffer copy
-            framebuffer.set(framebufferData);
-            
-            // Convert 8bpp indexed color to RGBA using DOOM palette
-            for (let i = 0; i < framebuffer.length; i++) {
-              const pixel = framebuffer[i];
-              const idx = i * 4;
-              // Calculate palette offset: paletteIndex * 256 entries * 3 RGB values
-              const paletteOffset = paletteIndex * 256 * 3;
-              const colorIdx = paletteOffset + pixel * 3;
-              // Use DOOM palette colors from the specified palette
-              imageData.data[idx] = doomColors[colorIdx];     // R
-              imageData.data[idx + 1] = doomColors[colorIdx + 1]; // G
-              imageData.data[idx + 2] = doomColors[colorIdx + 2]; // B
-              imageData.data[idx + 3] = 255;   // A
-            }
-            ctx.putImageData(imageData, 0, 0);
-          } else {
-            console.log('Received frame of unexpected size:', decompressedData.length, 'bytes (expected', WIDTH * HEIGHT * BYTES_PER_PIXEL + 1, 'for full frame)');
-          }
+          console.warn('Received frame of unexpected size:', data.length, 'bytes (expected', EXPECTED_FRAME_SIZE, 'bytes)');
         }
       } else {
         console.warn('Received non-binary data:', typeof event.data);

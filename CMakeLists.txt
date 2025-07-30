@@ -5,6 +5,6 @@ cmake_minimum_required(VERSION 3.16)
 # Set the partition table file
 set(PARTITION_TABLE_CSV_FILE "partitions.csv")
 
-set(COMPONENTS esptool_py main prboom-esp32-compat prboom)
+set(COMPONENTS esptool_py main prboom-esp32-compat prboom framebuffer-server)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project("esp32-doom")

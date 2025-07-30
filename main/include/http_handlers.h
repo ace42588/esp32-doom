@@ -28,6 +28,9 @@ void http_cleanup_static_files(void);
 const char* http_get_content_type(const char *filename);
 esp_err_t http_send_file_response(httpd_req_t *req, const char *filepath, const char *content_type);
 
+// PSRAM memory allocation utility
+void* http_alloc_psram_buffer(size_t size);
+
 #ifdef __cplusplus
 }
 #endif
