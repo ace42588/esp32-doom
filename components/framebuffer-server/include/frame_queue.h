@@ -6,7 +6,7 @@
 #define FRAME_HEIGHT 240
 #define FRAME_BPP    1     // 8bpp
 #define FRAME_SIZE   (FRAME_WIDTH * FRAME_HEIGHT)
-#define FRAME_QUEUE_DEPTH 2
+#define FRAME_QUEUE_DEPTH 3
 
 typedef struct {
     uint8_t *frames[FRAME_QUEUE_DEPTH];

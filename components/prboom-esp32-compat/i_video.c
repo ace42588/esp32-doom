@@ -61,7 +61,7 @@ int desired_fullscreen = 0;
 
 extern frame_queue_t g_frame_queue;
 
-unsigned char *screenbuf;
+static uint8_t *next_frame_buffer = NULL;
 static uint8_t current_palette = 0;
 
 /* I_StartTic
@@ -95,6 +95,12 @@ void I_UpdateNoBlit (void)
  */
 void I_StartFrame (void)
 {
+  next_frame_buffer = frame_queue_get_write_buffer(&g_frame_queue);
+  if (!next_frame_buffer) {
+    // Queue is full, need to wait for the next available buffer
+    //TODO: Handle this case
+  }
+  screens[0].data = next_frame_buffer + 1; // Skip the palette index at position 0
 }
 
 
@@ -112,21 +118,12 @@ void I_EndDisplay(void)
 //
 
 void I_FinishUpdate (void)
-{
-    uint8_t *scr=(uint8_t*)screens[0].data;
-
-    uint8_t *buf = frame_queue_get_write_buffer(&g_frame_queue);
-    if (!buf) {
-        // Queue is full — drop frame
-        return;
-    }
-    
+{  
+  if (next_frame_buffer) {
     // Set palette index at position 0
-    buf[0] = current_palette;
-    
-    // Copy current frame to backup buffer (starting at position 1)
-    memcpy(buf + 1, scr, SCREENWIDTH*SCREENHEIGHT);
+    next_frame_buffer[0] = current_palette;
     frame_queue_submit_frame(&g_frame_queue);
+  }
 }
 
 void I_SetPalette (int pal)
