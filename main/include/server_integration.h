@@ -14,6 +14,7 @@ extern "C" {
 // Function declarations
 esp_err_t server_integration_init(void);
 esp_err_t server_integration_start(void);
+esp_err_t server_integration_start_websocket(void);
 void server_integration_stop(void);
 void server_integration_task(void *pv);
 

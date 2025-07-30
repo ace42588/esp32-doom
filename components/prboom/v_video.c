@@ -100,7 +100,7 @@ void V_InitColorTranslation(void)
       *p->map = W_CacheLumpName(p->name);
     } else {
       // Color translation lump not found, use default (no translation)
-      lprintf(LO_WARN, "V_InitColorTranslation: %s not found, using default\n", p->name);
+      //lprintf(LO_WARN, "V_InitColorTranslation: %s not found, using default\n", p->name);
       *p->map = NULL;
     }
   }

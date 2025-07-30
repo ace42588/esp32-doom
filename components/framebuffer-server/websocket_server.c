@@ -296,8 +296,10 @@ int websocket_send_binary_frame(int client_fd, const uint8_t *data, size_t len) 
         size_t header_len = 0;
         
         // Set FIN bit only on last fragment, opcode only on first fragment
+        // Also set RSV1 bit (0x40) if this is compressed data
+        uint8_t rsv1_bit = (compressed_data && fragment_count == 0) ? 0x40 : 0x00;
         if (fragment_count == 0) {
-            header[0] = is_last ? 0x82 : 0x02; // First fragment: binary frame, FIN only if last
+            header[0] = (is_last ? 0x82 : 0x02) | rsv1_bit; // First fragment: binary frame, FIN only if last
         } else {
             header[0] = is_last ? 0x80 : 0x00; // Continuation frame: no opcode, FIN only if last
         }
@@ -457,6 +459,17 @@ int websocket_parse_deflate_extension(const char *extensions, char *response, si
     return -1;
 }
 
+// Custom allocation functions for miniz
+static void *miniz_alloc_func(void *opaque, size_t items, size_t size) {
+    (void)opaque;
+    return heap_caps_malloc(items * size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+static void miniz_free_func(void *opaque, void *address) {
+    (void)opaque;
+    heap_caps_free(address);
+}
+
 // Initialize compression for a client
 int websocket_init_compression(websocket_client_t *client) {
     if (!client) {
@@ -507,7 +520,16 @@ int websocket_init_compression(websocket_client_t *client) {
     memset(client->deflate_stream, 0, sizeof(mz_stream));
     memset(client->inflate_stream, 0, sizeof(mz_stream));
     
-    int deflate_result = mz_deflateInit2(client->deflate_stream, MZ_DEFAULT_COMPRESSION, MZ_DEFLATED, -15, 8, MZ_DEFAULT_STRATEGY);
+    // Set custom allocation functions
+    client->deflate_stream->zalloc = miniz_alloc_func;
+    client->deflate_stream->zfree = miniz_free_func;
+    client->deflate_stream->opaque = NULL;
+    
+    client->inflate_stream->zalloc = miniz_alloc_func;
+    client->inflate_stream->zfree = miniz_free_func;
+    client->inflate_stream->opaque = NULL;
+    
+    int deflate_result = mz_deflateInit2(client->deflate_stream, 1, MZ_DEFLATED, -15, 8, MZ_DEFAULT_STRATEGY);
     if (deflate_result != MZ_OK) {
         ESP_LOGE(TAG, "Failed to initialize deflate stream: %d", deflate_result);
         websocket_cleanup_compression(client);
@@ -636,8 +658,6 @@ static int handle_ws_frame(int client_fd) {
         }
         return 0; // No data available (normal for non-blocking socket)
     }
-    
-    ESP_LOGI(TAG, "Received %d bytes from client", len);
     
     uint8_t opcode, masked;
     uint64_t payload_len;
@@ -842,10 +862,10 @@ void websocket_server_task(void *pv) {
         // Send frame data to all connected clients (only if we have frames and clients)
         uint8_t *frame = frame_queue_get_next_frame(&g_frame_queue);
         if (frame && server->client_count > 0) {
-            ESP_LOGI(TAG, "Sending frame of size %zu bytes to %d clients", (size_t)(FRAME_SIZE + 1), server->client_count);
+            //ESP_LOGI(TAG, "Sending frame of size %zu bytes to %d clients", (size_t)(FRAME_SIZE + 1), server->client_count);
             for (int i = 0; i < WS_MAX_CLIENTS; i++) {
                 if (server->clients[i].fd >= 0 && server->clients[i].active) {
-                    ESP_LOGI(TAG, "Sending frame to client %d, palette index: %d", i, frame[0]);
+                    //ESP_LOGI(TAG, "Sending frame to client %d, palette index: %d", i, frame[0]);
                     if (websocket_send_binary_frame(server->clients[i].fd, frame, FRAME_SIZE + 1) < 0) {
                         ESP_LOGW(TAG, "Failed to send frame to client %d", i);
                         
@@ -859,7 +879,7 @@ void websocket_server_task(void *pv) {
                         server->clients[i].active = 0;
                         server->client_count--;
                     } else {
-                        ESP_LOGI(TAG, "Frame sent successfully to client %d", i);
+                        //ESP_LOGI(TAG, "Frame sent successfully to client %d", i);
                     }
                 }
             }

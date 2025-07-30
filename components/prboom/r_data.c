@@ -380,7 +380,7 @@ static void R_InitColormaps(void)
   
   if (firstcolormaplump == -1 || lastcolormaplump == -1) {
     // C_START/C_END markers not found, use default colormap only
-    lprintf(LO_WARN, "R_InitColormaps: C_START/C_END markers not found, using default colormap\n");
+    //lprintf(LO_WARN, "R_InitColormaps: C_START/C_END markers not found, using default colormap\n");
     numcolormaps = 1;
     colormaps = Z_Malloc(sizeof(*colormaps) * numcolormaps, PU_STATIC, 0);
     colormaps[0] = (const lighttable_t *)W_CacheLumpName("COLORMAP");
@@ -748,7 +748,7 @@ void R_SetPatchNum(patchnum_t *patchnum, const char *name)
   int lump = W_CheckNumForName(name);
   if (lump == -1) {
     // Patch not found, use default values
-    lprintf(LO_WARN, "R_SetPatchNum: patch %s not found, using default\n", name);
+    //lprintf(LO_WARN, "R_SetPatchNum: patch %s not found, using default\n", name);
     patchnum->width = 0;
     patchnum->height = 0;
     patchnum->leftoffset = 0;

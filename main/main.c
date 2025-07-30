@@ -24,11 +24,20 @@
 #include "i_system.h"
 #include "server_integration.h"
 #include "esp_heap_caps.h"
+#include "instrumentation.h"
+#include "websocket_server.h"
 
 #define DOOM_TASK_CORE 1         // Core 0 = WiFi, Core 1 = Doom
 #define DOOM_TASK_STACK_SIZE 32768  // 32KB is the absolute minimum
+#define DOOM_TASK_PRIORITY 4
+
+#define SERVER_TASK_CORE 0
 #define SERVER_TASK_STACK_SIZE 8192
 #define SERVER_TASK_PRIORITY 2
+
+#define WEBSOCKET_TASK_CORE 0
+#define WEBSOCKET_TASK_STACK_SIZE 8192
+#define WEBSOCKET_TASK_PRIORITY 3
 
 static const char *TAG = "Main Application";
 
@@ -76,27 +85,67 @@ void app_main(void) {
     // Disable WiFi power management to prevent crashes
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    // Start Doom game task after all initialization is complete
-    ESP_LOGI(TAG, "Creating DOOM task...");
+    // Initialize and start instrumentation system early to capture startup effects
+    ESP_LOGI(TAG, "Initializing instrumentation system...");
+    ESP_ERROR_CHECK(instrumentation_init());
     
-    // Log memory before DOOM task creation
-    size_t free_psram = 0;
-    if (esp_psram_is_initialized()) {
-        free_psram = esp_psram_get_size();
+    // Log initial configuration
+    instrumentation_log_configuration();
+    
+    // Start periodic instrumentation
+    instrumentation_start();
+
+    // Start server integration task (handles both HTTP and WebSocket)
+    ESP_LOGI(TAG, "Creating server integration task...");
+    BaseType_t server_task_created = xTaskCreatePinnedToCore(
+        &server_integration_task, 
+        "server_integration", 
+        SERVER_TASK_STACK_SIZE, 
+        NULL, 
+        SERVER_TASK_PRIORITY, 
+        NULL,
+        SERVER_TASK_CORE
+    );
+    if (server_task_created == pdPASS) {
+        ESP_LOGI(TAG, "Server integration task created successfully");
+    } else {
+        ESP_LOGE(TAG, "Failed to create server integration task");
+        return;
     }
-    // Get internal DRAM only (excluding PSRAM)
-    size_t free_internal_ram = heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-    size_t min_free_internal_ram = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
     
-    ESP_LOGI(TAG, "Memory before DOOM task - Free Internal RAM: %zu bytes, Min Free Internal RAM: %zu bytes, Free PSRAM: %zu bytes", 
-             free_internal_ram, min_free_internal_ram, free_psram);
+    // Start WebSocket server task
+    ESP_LOGI(TAG, "Creating WebSocket server task...");
+    BaseType_t ws_task_created = xTaskCreatePinnedToCore(
+        websocket_server_task, 
+        "websocket_server", 
+        WEBSOCKET_TASK_STACK_SIZE, 
+        NULL, 
+        WEBSOCKET_TASK_PRIORITY, 
+        NULL,
+        WEBSOCKET_TASK_CORE
+    );
+    if (ws_task_created == pdPASS) {
+        ESP_LOGI(TAG, "WebSocket server task created successfully");
+    } else {
+        ESP_LOGE(TAG, "Failed to create WebSocket server task");
+        return;
+    }
     
-    BaseType_t task_created = xTaskCreatePinnedToCore(&doom_task, "doom", DOOM_TASK_STACK_SIZE, NULL, 3, NULL, DOOM_TASK_CORE);
+    // Start Doom game task after instrumentation is ready
+    ESP_LOGI(TAG, "Creating DOOM task...");
+    BaseType_t task_created = xTaskCreatePinnedToCore(
+        &doom_task, 
+        "doom", 
+        DOOM_TASK_STACK_SIZE, 
+        NULL, 
+        DOOM_TASK_PRIORITY, 
+        NULL, 
+        DOOM_TASK_CORE
+    );
     if (task_created == pdPASS) {
         ESP_LOGI(TAG, "DOOM task created successfully on Core %d", DOOM_TASK_CORE);
     } else {
         ESP_LOGE(TAG, "Failed to create DOOM task");
-        ESP_LOGE(TAG, "Available Internal RAM: %zu bytes, Required: %zu bytes", free_internal_ram, DOOM_TASK_STACK_SIZE);
         
         // Check specific error conditions
         if (task_created == errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY) {
@@ -106,16 +155,6 @@ void app_main(void) {
         } else {
             ESP_LOGE(TAG, "Error: Unknown error code %d", task_created);
         }
-        return;
-    }
-    
-    // Start server integration task (handles both HTTP and WebSocket)
-    ESP_LOGI(TAG, "Creating server integration task...");
-    BaseType_t server_task_created = xTaskCreate(&server_integration_task, "server_integration", SERVER_TASK_STACK_SIZE, NULL, SERVER_TASK_PRIORITY, NULL);
-    if (server_task_created == pdPASS) {
-        ESP_LOGI(TAG, "Server integration task created successfully");
-    } else {
-        ESP_LOGE(TAG, "Failed to create server integration task");
         return;
     }
 }

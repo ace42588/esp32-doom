@@ -2,7 +2,7 @@
   "C_Cpp.intelliSenseEngine": "default",
   "idf.espIdfPath": "/Users/trace/esp/v5.5/esp-idf",
   "idf.toolsPath": "/Users/trace/.espressif",
-  "idf.pythonInstallPath": "/usr/bin/python3",
+  "idf.pythonInstallPath": "C:\\Users\\Trace\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
   "cmake.sourceDirectory": "/Users/trace/esp32-doom/ws_echo_server",
   "idf.flashType": "UART",
   "idf.openOcdConfigs": [
@@ -12,5 +12,6 @@
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
   },
-  "idf.port": "/dev/tty.usbserial-10"
+  "idf.port": "/dev/tty.usbserial-10",
+  "idf.portWin": "COM5"
 }

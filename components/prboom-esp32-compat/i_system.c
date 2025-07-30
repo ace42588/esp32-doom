@@ -218,17 +218,6 @@ static void init_fds(void) {
 	lprintf(LO_INFO, "File descriptors initialized\n");
 }
 
-// Debug function to check file descriptor state
-static void debug_fds(const char* location) {
-	lprintf(LO_INFO, "DEBUG_FDS[%s]: ", location);
-	for (int i = 0; i < MAX_N_FILES; ++i) {
-		lprintf(LO_INFO, "fd[%d]=%s(part=%p,handle=%lu,ptr=%p,offset=%d) ", 
-				i, fds[i].is_open ? "OPEN" : "CLOSED", 
-				fds[i].part, fds[i].handle, fds[i].mmap_ptr, fds[i].offset);
-	}
-	lprintf(LO_INFO, "\n");
-}
-
 // Validate file descriptor
 static bool is_valid_fd(int fd) {
 	return fd >= 0 && fd < MAX_N_FILES && fds[fd].is_open && fds[fd].part != NULL;
@@ -256,8 +245,6 @@ static void cleanup_fd(int fd) {
 	 FileDesc *file = NULL;
 	 int fd = -1;
 	 lprintf(LO_INFO, "I_Open: trying to open %s\n", wad);
-	 
-	 debug_fds("I_Open_start");
 	 
 	 // Find a free file descriptor
 	 for (int i = 0; i < MAX_N_FILES; ++i) {
@@ -330,13 +317,6 @@ static void cleanup_fd(int fd) {
 	 ESP_LOGI("i_system", "%s @%p", wad, file->mmap_ptr);
 	 lprintf(LO_INFO, "I_Open: successfully opened %s (size: %lu bytes)\n", wad, file->part->size);
 	 
-	 // Debug: Check the first few bytes of the mapped file
-	 unsigned char *data = (unsigned char*)file->mmap_ptr;
-	 lprintf(LO_INFO, "I_Open: First 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-			 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-			 data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]);
- 
-	 debug_fds("I_Open_end");
 	 return fd;
  }
  
@@ -378,7 +358,6 @@ static void cleanup_fd(int fd) {
 	 }
 	 
 	 cleanup_fd(fd);
-	 debug_fds("I_Close_end");
 }
  
  void *I_Mmap(void *addr, size_t length, int prot, int flags, int ifd, off_t offset) {

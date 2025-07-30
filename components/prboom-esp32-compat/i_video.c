@@ -53,6 +53,8 @@
 
 #include "esp_task.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "frame_queue.h"
 
 int use_doublebuffer = 0;
@@ -61,7 +63,7 @@ int desired_fullscreen = 0;
 
 extern frame_queue_t g_frame_queue;
 
-static uint8_t *next_frame_buffer = NULL;
+unsigned char *screenbuf;
 static uint8_t current_palette = 0;
 
 /* I_StartTic
@@ -95,12 +97,7 @@ void I_UpdateNoBlit (void)
  */
 void I_StartFrame (void)
 {
-  next_frame_buffer = frame_queue_get_write_buffer(&g_frame_queue);
-  if (!next_frame_buffer) {
-    // Queue is full, need to wait for the next available buffer
-    //TODO: Handle this case
-  }
-  screens[0].data = next_frame_buffer + 1; // Skip the palette index at position 0
+
 }
 
 
@@ -118,12 +115,17 @@ void I_EndDisplay(void)
 //
 
 void I_FinishUpdate (void)
-{  
-  if (next_frame_buffer) {
-    // Set palette index at position 0
-    next_frame_buffer[0] = current_palette;
-    frame_queue_submit_frame(&g_frame_queue);
+{
+  uint8_t *scr=(uint8_t*)screens[0].data;
+  uint8_t *buf = frame_queue_get_write_buffer(&g_frame_queue);
+  if (!buf) {
+    // Queue is full — drop frame
+    return;
   }
+
+  buf[0] = current_palette;
+  memcpy(buf+1, scr, SCREENWIDTH*SCREENHEIGHT);
+  frame_queue_submit_frame(&g_frame_queue);
 }
 
 void I_SetPalette (int pal)
@@ -141,14 +143,15 @@ void I_SetPalette (int pal)
 
 void I_PreInitGraphics(void)
 {
-	lprintf(LO_INFO, "preinitgfx");
-	// Allocate screen buffer in PSRAM since it's large (320x240 = 76.8KB)
-	// Internal memory is limited and we need it for other allocations
-	screenbuf = heap_caps_malloc(SCREENWIDTH*SCREENHEIGHT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-	assert(screenbuf);
-	
-	lprintf(LO_INFO, "Allocated framebuffers: main=%p, size=%d", 
-	        screenbuf, SCREENWIDTH*SCREENHEIGHT);
+  // Wait until the frame queue is initialized and ready
+  lprintf(LO_INFO, "I_PreInitGraphics: Waiting for frame queue to be ready...\n");
+  while (!frame_queue_get_write_buffer(&g_frame_queue)) {
+    // Frame queue not ready yet, wait a bit
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  screenbuf = heap_caps_malloc(SCREENWIDTH*SCREENHEIGHT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  assert(screenbuf);
+  lprintf(LO_INFO, "I_PreInitGraphics: Frame queue is ready\n");
 }
 
 

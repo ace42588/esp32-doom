@@ -1,4 +1,4 @@
-idf_component_register(SRCS "server_integration.c" "http_handlers.c" "main.c"
+idf_component_register(SRCS "server_integration.c" "http_handlers.c" "main.c" "instrumentation.c"
                     PRIV_REQUIRES esp_wifi nvs_flash spiffs esp_eth fatfs prboom prboom-esp32-compat esp_timer esp_psram framebuffer-server esp_http_server
                     INCLUDE_DIRS include)
 

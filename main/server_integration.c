@@ -88,15 +88,23 @@ esp_err_t server_integration_start(void) {
     httpd_register_uri_handler(g_http_server, &palette_uri);
     httpd_register_uri_handler(g_http_server, &websocket_uri);
     
-    // Start WebSocket server task (it will start the server internally)
-    BaseType_t ws_task_created = xTaskCreate(websocket_server_task, "websocket_server", 8192, NULL, 2, NULL);
-    if (ws_task_created == pdPASS) {
-        ESP_LOGI(TAG, "WebSocket server task created successfully");
-    } else {
-        ESP_LOGE(TAG, "Failed to create WebSocket server task");
+    ESP_LOGI(TAG, "Server integration started on port %d", HTTP_SERVER_PORT);
+    return ESP_OK;
+}
+
+esp_err_t server_integration_start_websocket(void) {
+    ESP_LOGI(TAG, "Starting WebSocket server");
+    
+    // Initialize and start the WebSocket server
+    websocket_server_init(&g_websocket_server);
+    websocket_server_start(&g_websocket_server);
+    
+    if (g_websocket_server.server_fd < 0) {
+        ESP_LOGE(TAG, "Failed to start WebSocket server");
+        return ESP_FAIL;
     }
     
-    ESP_LOGI(TAG, "Server integration started on port %d", HTTP_SERVER_PORT);
+    ESP_LOGI(TAG, "WebSocket server started successfully");
     return ESP_OK;
 }
 

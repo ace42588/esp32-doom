@@ -10,11 +10,11 @@ extern "C" {
 // WebSocket server configuration
 #define WS_PORT 8080
 #define MAX_HEADER 2048
-#define WS_MAX_CLIENTS 4
+#define WS_MAX_CLIENTS 1
 #define WS_FRAME_BUFFER_SIZE 4096
 
 // Enable permessage-deflate support (optional)
-#define WS_ENABLE_PERMESSAGE_DEFLATE 1
+#define WS_ENABLE_PERMESSAGE_DEFLATE 0
 
 // WebSocket frame types
 #define WS_FRAME_CONTINUATION 0x0
