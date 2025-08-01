@@ -85,16 +85,6 @@
  #include <stdbool.h> // Added for bool type
  
  int realtime=0;
-
-// Joystick axis mappings (stub values for ESP32) - these are missing from PrBoom
-int joyleft = 0;   // Left direction
-int joyright = 0;  // Right direction
-int joyup = 0;     // Up direction
-int joydown = 0;   // Down direction
-
-// Joystick enable flag (disabled for ESP32) - this is missing from PrBoom
-int usejoystick = 0;
- 
  
  void I_uSleep(unsigned long usecs)
  {
@@ -104,8 +94,7 @@ int usejoystick = 0;
  static unsigned long getMsTicks() {
    struct timeval tv;
    struct timezone tz;
- //  unsigned long thistimereply;
- 
+
    gettimeofday(&tv, &tz);
  
    //convert to ms
@@ -133,7 +122,6 @@ int usejoystick = 0;
  {
    unsigned long now;
    fixed_t frac;
- 
  
    now = getMsTicks();
  

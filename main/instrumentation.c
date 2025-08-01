@@ -9,7 +9,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
+#include "freertos/semphr.h"
 #include "sdkconfig.h"
+#include <string.h>
 
 static const char *TAG = "Instrumentation";
 
@@ -22,6 +24,20 @@ static TimerHandle_t instrumentation_timer = NULL;
 static wifi_throughput_stats_t wifi_stats = {0};
 static SemaphoreHandle_t wifi_stats_mutex = NULL;
 static bool wifi_instrumentation_initialized = false;
+
+// CPU usage tracking (protected by mutex)
+static cpu_task_stats_t cpu_stats[MAX_TASKS_TO_TRACK] = {0};
+static uint32_t cpu_stats_count = 0;
+static SemaphoreHandle_t cpu_stats_mutex = NULL;
+static uint32_t last_cpu_stats_time = 0;
+
+// PSRAM bandwidth tracking (protected by mutex)
+static psram_bandwidth_stats_t psram_stats = {0};
+static SemaphoreHandle_t psram_stats_mutex = NULL;
+
+// Network throughput tracking (protected by mutex)
+static network_throughput_stats_t network_stats = {0};
+static SemaphoreHandle_t network_stats_mutex = NULL;
 
 // Configuration cache
 static struct {
@@ -164,6 +180,157 @@ memory_stats_t instrumentation_get_ultra_safe_memory_stats(void) {
     }
     
     return stats;
+}
+
+/**
+ * @brief Get CPU usage per task with detailed statistics
+ */
+esp_err_t instrumentation_get_cpu_usage_per_task(cpu_task_stats_t *stats, uint32_t *count) {
+    if (!stats || !count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (xSemaphoreTake(cpu_stats_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to acquire CPU stats mutex");
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    // Copy current CPU stats
+    *count = cpu_stats_count;
+    for (uint32_t i = 0; i < cpu_stats_count && i < MAX_TASKS_TO_TRACK; i++) {
+        stats[i] = cpu_stats[i];
+    }
+    
+    xSemaphoreGive(cpu_stats_mutex);
+    return ESP_OK;
+}
+
+/**
+ * @brief Update CPU usage statistics for all tasks
+ */
+static void update_cpu_usage_stats(void) {
+    if (xSemaphoreTake(cpu_stats_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to acquire CPU stats mutex for update");
+        return;
+    }
+    
+    uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t time_diff = current_time - last_cpu_stats_time;
+    
+    if (time_diff < 100) { // Minimum 100ms between updates
+        xSemaphoreGive(cpu_stats_mutex);
+        return;
+    }
+    
+    // Get all tasks
+    UBaseType_t task_count = uxTaskGetNumberOfTasks();
+    TaskStatus_t *task_status_array = pvPortMalloc(task_count * sizeof(TaskStatus_t));
+    
+    if (!task_status_array) {
+        ESP_LOGE(TAG, "Failed to allocate task status array for CPU stats");
+        xSemaphoreGive(cpu_stats_mutex);
+        return;
+    }
+    
+    UBaseType_t actual_task_count = uxTaskGetSystemState(task_status_array, task_count, NULL);
+    
+    if (actual_task_count > 0) {
+        cpu_stats_count = 0;
+        uint32_t total_runtime = 0;
+        
+        // Calculate total runtime for all tasks
+        for (UBaseType_t i = 0; i < actual_task_count; i++) {
+            total_runtime += task_status_array[i].ulRunTimeCounter;
+        }
+        
+        // Update CPU stats for each task
+        for (UBaseType_t i = 0; i < actual_task_count && cpu_stats_count < MAX_TASKS_TO_TRACK; i++) {
+            cpu_task_stats_t *task_stat = &cpu_stats[cpu_stats_count];
+            
+            // Copy task name
+            strncpy(task_stat->task_name, task_status_array[i].pcTaskName, configMAX_TASK_NAME_LEN - 1);
+            task_stat->task_name[configMAX_TASK_NAME_LEN - 1] = '\0';
+            
+            // Calculate CPU usage percentage
+            if (total_runtime > 0) {
+                task_stat->cpu_usage_percent = (task_status_array[i].ulRunTimeCounter * 100) / total_runtime;
+            } else {
+                task_stat->cpu_usage_percent = 0;
+            }
+            
+            // Update runtime statistics
+            uint32_t current_runtime = task_status_array[i].ulRunTimeCounter;
+            uint32_t runtime_diff = current_runtime - task_stat->last_runtime_ticks;
+            
+            task_stat->last_runtime_ticks = current_runtime;
+            task_stat->total_runtime_ticks = current_runtime;
+            task_stat->run_count = task_status_array[i].ulRunTimeCounter;
+            
+            // Calculate frequency (runs per second)
+            if (time_diff > 0) {
+                task_stat->frequency_hz = (runtime_diff * 1000) / time_diff;
+            }
+            
+            // Update min/max/avg runtime
+            uint32_t runtime_ms = (runtime_diff * portTICK_PERIOD_MS);
+            if (runtime_ms < task_stat->min_runtime_ms || task_stat->min_runtime_ms == 0) {
+                task_stat->min_runtime_ms = runtime_ms;
+            }
+            if (runtime_ms > task_stat->max_runtime_ms) {
+                task_stat->max_runtime_ms = runtime_ms;
+            }
+            
+            // Calculate average runtime (simple moving average)
+            task_stat->avg_runtime_ms = (task_stat->avg_runtime_ms + runtime_ms) / 2;
+            
+            // Stack information
+            task_stat->stack_high_water_mark = task_status_array[i].usStackHighWaterMark;
+            task_stat->stack_size = task_status_array[i].usStackHighWaterMark * 2; // Estimate
+            task_stat->priority = task_status_array[i].uxCurrentPriority;
+            task_stat->runtime_percentage = task_stat->cpu_usage_percent;
+            
+            cpu_stats_count++;
+        }
+    }
+    
+    last_cpu_stats_time = current_time;
+    vPortFree(task_status_array);
+    xSemaphoreGive(cpu_stats_mutex);
+}
+
+/**
+ * @brief Log CPU usage per task statistics
+ */
+static void log_cpu_usage_stats(void) {
+    cpu_task_stats_t stats[MAX_TASKS_TO_TRACK];
+    uint32_t count = 0;
+    
+    esp_err_t ret = instrumentation_get_cpu_usage_per_task(stats, &count);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to get CPU usage stats");
+        return;
+    }
+    
+#if INSTRUMENTATION_LIGHTWEIGHT_MODE
+    ESP_LOGI(TAG, "=== CPU USAGE ===");
+    for (uint32_t i = 0; i < count; i++) {
+        ESP_LOGI(TAG, "%s: %u%%", stats[i].task_name, stats[i].cpu_usage_percent);
+    }
+#else
+    ESP_LOGI(TAG, "=== CPU USAGE PER TASK ===");
+    ESP_LOGI(TAG, "Task Name           | CPU%% | Stack | Priority | Freq(Hz) | Avg(ms)");
+    ESP_LOGI(TAG, "-------------------|------|-------|----------|----------|--------");
+    
+    for (uint32_t i = 0; i < count; i++) {
+        ESP_LOGI(TAG, "%-18s | %3u%% | %5u | %8u | %8u | %7u",
+                 stats[i].task_name,
+                 stats[i].cpu_usage_percent,
+                 stats[i].stack_high_water_mark,
+                 stats[i].priority,
+                 stats[i].frequency_hz,
+                 stats[i].avg_runtime_ms);
+    }
+#endif
 }
 
 /**
@@ -349,6 +516,305 @@ static void log_wifi_stats(void) {
 }
 
 /**
+ * @brief Get PSRAM bandwidth statistics
+ */
+esp_err_t instrumentation_get_psram_bandwidth_stats(psram_bandwidth_stats_t *stats) {
+    if (!stats) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (xSemaphoreTake(psram_stats_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to acquire PSRAM stats mutex");
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    *stats = psram_stats;
+    xSemaphoreGive(psram_stats_mutex);
+    return ESP_OK;
+}
+
+/**
+ * @brief Track PSRAM read operation
+ */
+void instrumentation_psram_read_operation(uint32_t bytes) {
+    if (xSemaphoreTake(psram_stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        psram_stats.read_operations++;
+        psram_stats.bytes_read += bytes;
+        xSemaphoreGive(psram_stats_mutex);
+    }
+}
+
+/**
+ * @brief Track PSRAM write operation
+ */
+void instrumentation_psram_write_operation(uint32_t bytes) {
+    if (xSemaphoreTake(psram_stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        psram_stats.write_operations++;
+        psram_stats.bytes_written += bytes;
+        xSemaphoreGive(psram_stats_mutex);
+    }
+}
+
+/**
+ * @brief Track PSRAM cache hit
+ */
+void instrumentation_psram_cache_hit(void) {
+    if (xSemaphoreTake(psram_stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        psram_stats.cache_hits++;
+        xSemaphoreGive(psram_stats_mutex);
+    }
+}
+
+/**
+ * @brief Track PSRAM cache miss
+ */
+void instrumentation_psram_cache_miss(void) {
+    if (xSemaphoreTake(psram_stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        psram_stats.cache_misses++;
+        xSemaphoreGive(psram_stats_mutex);
+    }
+}
+
+/**
+ * @brief Update PSRAM bandwidth utilization
+ */
+static void update_psram_bandwidth_stats(void) {
+    if (xSemaphoreTake(psram_stats_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to acquire PSRAM stats mutex for update");
+        return;
+    }
+    
+    uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t time_diff = current_time - psram_stats.last_reset_time;
+    
+    if (time_diff > 0) {
+        // Calculate bandwidth utilization based on total operations
+        uint32_t total_operations = psram_stats.read_operations + psram_stats.write_operations;
+        uint32_t total_bytes = psram_stats.bytes_read + psram_stats.bytes_written;
+        
+        // Calculate actual bandwidth in bytes per second
+        uint32_t bytes_per_second = (total_bytes * 1000) / time_diff;
+        
+        // Estimate bandwidth utilization based on operations and access patterns
+        // PSRAM theoretical bandwidth is ~40MB/s, but actual usable bandwidth is lower
+        // Consider both operation frequency and data volume
+        uint32_t theoretical_bandwidth_bps = 20 * 1024 * 1024; // 20 MB/s conservative estimate
+        
+        if (theoretical_bandwidth_bps > 0) {
+            // Calculate utilization based on both data volume and operation frequency
+            uint32_t data_utilization = (bytes_per_second * 100) / theoretical_bandwidth_bps;
+            uint32_t operation_utilization = 0;
+            
+            // Factor in operation frequency (high frequency = higher utilization)
+            if (time_diff > 0) {
+                uint32_t ops_per_second = (total_operations * 1000) / time_diff;
+                // Assume max 1000 ops/sec is 100% utilization
+                operation_utilization = (ops_per_second * 100) / 1000;
+                if (operation_utilization > 100) operation_utilization = 100;
+            }
+            
+            // Combine data and operation utilization
+            psram_stats.bandwidth_utilization_percent = (data_utilization + operation_utilization) / 2;
+            
+            if (psram_stats.bandwidth_utilization_percent > 100) {
+                psram_stats.bandwidth_utilization_percent = 100;
+            }
+        }
+        
+        // Reset counters for next period
+        psram_stats.read_operations = 0;
+        psram_stats.write_operations = 0;
+        psram_stats.bytes_read = 0;
+        psram_stats.bytes_written = 0;
+        psram_stats.cache_hits = 0;
+        psram_stats.cache_misses = 0;
+        psram_stats.last_reset_time = current_time;
+    }
+    
+    xSemaphoreGive(psram_stats_mutex);
+}
+
+/**
+ * @brief Log PSRAM bandwidth statistics
+ */
+static void log_psram_bandwidth_stats(void) {
+    psram_bandwidth_stats_t stats;
+    
+    esp_err_t ret = instrumentation_get_psram_bandwidth_stats(&stats);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to get PSRAM bandwidth stats");
+        return;
+    }
+    
+#if INSTRUMENTATION_LIGHTWEIGHT_MODE
+    ESP_LOGI(TAG, "=== PSRAM ===");
+    ESP_LOGI(TAG, "Read: %u ops, %u bytes", stats.read_operations, stats.bytes_read);
+    ESP_LOGI(TAG, "Write: %u ops, %u bytes", stats.write_operations, stats.bytes_written);
+    ESP_LOGI(TAG, "Cache: %u hits, %u misses", stats.cache_hits, stats.cache_misses);
+    ESP_LOGI(TAG, "Bandwidth: %u%%", stats.bandwidth_utilization_percent);
+#else
+    ESP_LOGI(TAG, "=== PSRAM BANDWIDTH STATS ===");
+    ESP_LOGI(TAG, "Read Operations: %u", stats.read_operations);
+    ESP_LOGI(TAG, "Write Operations: %u", stats.write_operations);
+    ESP_LOGI(TAG, "Bytes Read: %u", stats.bytes_read);
+    ESP_LOGI(TAG, "Bytes Written: %u", stats.bytes_written);
+    ESP_LOGI(TAG, "Cache Hits: %u", stats.cache_hits);
+    ESP_LOGI(TAG, "Cache Misses: %u", stats.cache_misses);
+    
+    if (stats.cache_hits + stats.cache_misses > 0) {
+        uint32_t cache_hit_rate = (stats.cache_hits * 100) / (stats.cache_hits + stats.cache_misses);
+        ESP_LOGI(TAG, "Cache Hit Rate: %u%%", cache_hit_rate);
+    }
+    
+    ESP_LOGI(TAG, "Bandwidth Utilization: %u%%", stats.bandwidth_utilization_percent);
+#endif
+}
+
+/**
+ * @brief Get network throughput statistics
+ */
+esp_err_t instrumentation_get_network_throughput_stats(network_throughput_stats_t *stats) {
+    if (!stats) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (xSemaphoreTake(network_stats_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to acquire network stats mutex");
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    *stats = network_stats;
+    xSemaphoreGive(network_stats_mutex);
+    return ESP_OK;
+}
+
+/**
+ * @brief Track network bytes sent
+ */
+void instrumentation_network_sent_bytes(uint32_t bytes) {
+    if (xSemaphoreTake(network_stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        network_stats.bytes_sent += bytes;
+        network_stats.packets_sent++;
+        xSemaphoreGive(network_stats_mutex);
+    }
+}
+
+/**
+ * @brief Track network bytes received
+ */
+void instrumentation_network_received_bytes(uint32_t bytes) {
+    if (xSemaphoreTake(network_stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        network_stats.bytes_received += bytes;
+        network_stats.packets_received++;
+        xSemaphoreGive(network_stats_mutex);
+    }
+}
+
+/**
+ * @brief Track network packet sent
+ */
+void instrumentation_network_sent_packet(void) {
+    if (xSemaphoreTake(network_stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        network_stats.packets_sent++;
+        xSemaphoreGive(network_stats_mutex);
+    }
+}
+
+/**
+ * @brief Track network packet received
+ */
+void instrumentation_network_received_packet(void) {
+    if (xSemaphoreTake(network_stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        network_stats.packets_received++;
+        xSemaphoreGive(network_stats_mutex);
+    }
+}
+
+/**
+ * @brief Update network throughput statistics
+ */
+static void update_network_throughput_stats(void) {
+    if (xSemaphoreTake(network_stats_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to acquire network stats mutex for update");
+        return;
+    }
+    
+    uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t time_diff = current_time - network_stats.last_reset_time;
+    
+    if (time_diff > 0) {
+        // Calculate bytes per second
+        network_stats.bytes_per_sec_sent = (network_stats.bytes_sent * 1000) / time_diff;
+        network_stats.bytes_per_sec_received = (network_stats.bytes_received * 1000) / time_diff;
+        
+        // Calculate packets per second
+        network_stats.packets_per_sec_sent = (network_stats.packets_sent * 1000) / time_diff;
+        network_stats.packets_per_sec_received = (network_stats.packets_received * 1000) / time_diff;
+        
+        // Calculate connection quality based on WiFi RSSI
+        if (wifi_stats.wifi_rssi != 0) {
+            // RSSI ranges from -100 (poor) to -30 (excellent)
+            int8_t rssi = wifi_stats.wifi_rssi;
+            if (rssi >= -50) {
+                network_stats.connection_quality_percent = 100;
+            } else if (rssi >= -60) {
+                network_stats.connection_quality_percent = 90;
+            } else if (rssi >= -70) {
+                network_stats.connection_quality_percent = 75;
+            } else if (rssi >= -80) {
+                network_stats.connection_quality_percent = 50;
+            } else if (rssi >= -90) {
+                network_stats.connection_quality_percent = 25;
+            } else {
+                network_stats.connection_quality_percent = 10;
+            }
+        }
+        
+        // Calculate retransmission rate (simplified)
+        uint32_t total_packets = network_stats.packets_sent + network_stats.packets_received;
+        if (total_packets > 0) {
+            // Estimate retransmission rate based on WiFi errors
+            uint32_t total_errors = wifi_stats.wifi_tx_errors + wifi_stats.wifi_rx_errors;
+            network_stats.retransmission_rate_percent = (total_errors * 100) / total_packets;
+            if (network_stats.retransmission_rate_percent > 100) {
+                network_stats.retransmission_rate_percent = 100;
+            }
+        }
+    }
+    
+    xSemaphoreGive(network_stats_mutex);
+}
+
+/**
+ * @brief Log network throughput statistics
+ */
+static void log_network_throughput_stats(void) {
+    network_throughput_stats_t stats;
+    
+    esp_err_t ret = instrumentation_get_network_throughput_stats(&stats);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to get network throughput stats");
+        return;
+    }
+    
+#if INSTRUMENTATION_LIGHTWEIGHT_MODE
+    ESP_LOGI(TAG, "=== NETWORK ===");
+    ESP_LOGI(TAG, "Sent: %u bytes/s", stats.bytes_per_sec_sent);
+    ESP_LOGI(TAG, "Received: %u bytes/s", stats.bytes_per_sec_received);
+    ESP_LOGI(TAG, "Quality: %u%%", stats.connection_quality_percent);
+    ESP_LOGI(TAG, "Retransmit: %u%%", stats.retransmission_rate_percent);
+#else
+    ESP_LOGI(TAG, "=== NETWORK THROUGHPUT STATS ===");
+    ESP_LOGI(TAG, "Bytes Sent: %u (%u bytes/sec)", stats.bytes_sent, stats.bytes_per_sec_sent);
+    ESP_LOGI(TAG, "Bytes Received: %u (%u bytes/sec)", stats.bytes_received, stats.bytes_per_sec_received);
+    ESP_LOGI(TAG, "Packets Sent: %u (%u packets/sec)", stats.packets_sent, stats.packets_per_sec_sent);
+    ESP_LOGI(TAG, "Packets Received: %u (%u packets/sec)", stats.packets_received, stats.packets_per_sec_received);
+    ESP_LOGI(TAG, "Connection Quality: %u%%", stats.connection_quality_percent);
+    ESP_LOGI(TAG, "Retransmission Rate: %u%%", stats.retransmission_rate_percent);
+#endif
+}
+
+/**
  * @brief Log system configuration
  */
 void instrumentation_log_configuration(void) {
@@ -414,6 +880,25 @@ static void instrumentation_timer_callback(TimerHandle_t xTimer) {
     // Update and log WiFi stats (with error handling)
     instrumentation_wifi_update_stats();
     log_wifi_stats();
+    
+    // Update and log CPU usage stats (with error handling)
+    update_cpu_usage_stats();
+    log_cpu_usage_stats();
+
+    // Update and log PSRAM bandwidth stats (with error handling)
+    update_psram_bandwidth_stats();
+    log_psram_bandwidth_stats();
+
+    // Update and log network throughput stats (with error handling)
+    update_network_throughput_stats();
+    log_network_throughput_stats();
+    
+    // Log comprehensive system statistics
+    instrumentation_log_comprehensive_stats();
+    
+    // Log WebSocket profiling stats (if available)
+    extern void log_all_websocket_profiles(void);
+    log_all_websocket_profiles();
     
     ESP_LOGI(TAG, "=== END REPORT ===");
 }
@@ -483,6 +968,27 @@ esp_err_t instrumentation_init(void) {
         ESP_LOGE(TAG, "Failed to create WiFi stats mutex");
         return ESP_ERR_NO_MEM;
     }
+
+    // Create mutex for CPU stats
+    cpu_stats_mutex = xSemaphoreCreateMutex();
+    if (!cpu_stats_mutex) {
+        ESP_LOGE(TAG, "Failed to create CPU stats mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Create mutex for PSRAM stats
+    psram_stats_mutex = xSemaphoreCreateMutex();
+    if (!psram_stats_mutex) {
+        ESP_LOGE(TAG, "Failed to create PSRAM stats mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Create mutex for network stats
+    network_stats_mutex = xSemaphoreCreateMutex();
+    if (!network_stats_mutex) {
+        ESP_LOGE(TAG, "Failed to create network stats mutex");
+        return ESP_ERR_NO_MEM;
+    }
     
     // Cache configuration values
     config_cache.cpu_freq_mhz = 240;  // ESP32 default CPU frequency in MHz
@@ -506,13 +1012,23 @@ esp_err_t instrumentation_init(void) {
     // Initialize WiFi stats
     wifi_stats.last_reset_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
     
+    // Initialize PSRAM stats
+    psram_stats.last_reset_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    
+    // Initialize network stats
+    network_stats.last_reset_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    
+    // Initialize CPU stats
+    last_cpu_stats_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    cpu_stats_count = 0;
+    
     // Initialize WiFi driver statistics tracking
     ret = instrumentation_wifi_init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to initialize WiFi instrumentation: %s", esp_err_to_name(ret));
     }
     
-    ESP_LOGI(TAG, "Instrumentation system initialized");
+    ESP_LOGI(TAG, "Instrumentation system initialized with comprehensive monitoring");
     return ESP_OK;
 }
 
@@ -601,4 +1117,95 @@ void instrumentation_wifi_sent_packet(void) {
 void instrumentation_wifi_received_packet(void) {
     // Deprecated - use esp_wifi_statis_dump() instead
     ESP_LOGW(TAG, "instrumentation_wifi_received_packet() is deprecated - use esp_wifi_statis_dump()");
+} 
+
+/**
+ * @brief Get comprehensive system statistics
+ */
+esp_err_t instrumentation_get_comprehensive_stats(system_stats_t *stats) {
+    if (!stats) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Get CPU stats
+    esp_err_t ret = instrumentation_get_cpu_usage_per_task(stats->cpu_stats, &stats->cpu_stats_count);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to get CPU stats");
+    }
+    
+    // Get PSRAM stats
+    ret = instrumentation_get_psram_bandwidth_stats(&stats->psram_stats);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to get PSRAM stats");
+    }
+    
+    // Get network stats
+    ret = instrumentation_get_network_throughput_stats(&stats->network_stats);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to get network stats");
+    }
+    
+    // Get memory stats
+    stats->memory_stats = instrumentation_get_heap_memory_stats();
+    
+    // Get WiFi stats
+    stats->wifi_stats = wifi_stats;
+    
+    // Calculate total CPU usage
+    stats->total_cpu_usage_percent = 0;
+    for (uint32_t i = 0; i < stats->cpu_stats_count; i++) {
+        stats->total_cpu_usage_percent += stats->cpu_stats[i].cpu_usage_percent;
+    }
+    
+    // Get system uptime
+    stats->system_uptime_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief Log comprehensive system statistics
+ */
+void instrumentation_log_comprehensive_stats(void) {
+    system_stats_t stats = {0};
+    
+    esp_err_t ret = instrumentation_get_comprehensive_stats(&stats);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to get comprehensive stats");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "=== COMPREHENSIVE SYSTEM STATS ===");
+    ESP_LOGI(TAG, "System Uptime: %u ms", stats.system_uptime_ms);
+    ESP_LOGI(TAG, "Total CPU Usage: %u%%", stats.total_cpu_usage_percent);
+    
+    // Log memory summary
+    ESP_LOGI(TAG, "Memory - Free RAM: %zu bytes, PSRAM: %zu bytes", 
+             stats.memory_stats.free_internal_ram, stats.memory_stats.free_psram);
+    
+    // Log PSRAM bandwidth summary
+    ESP_LOGI(TAG, "PSRAM - Bandwidth: %u%%, Read: %u ops, Write: %u ops",
+             stats.psram_stats.bandwidth_utilization_percent,
+             stats.psram_stats.read_operations, stats.psram_stats.write_operations);
+    
+    // Log network summary
+    ESP_LOGI(TAG, "Network - Sent: %u bytes/s, Received: %u bytes/s, Quality: %u%%",
+             stats.network_stats.bytes_per_sec_sent, stats.network_stats.bytes_per_sec_received,
+             stats.network_stats.connection_quality_percent);
+    
+    // Log WiFi summary
+    ESP_LOGI(TAG, "WiFi - RSSI: %d dBm, Channel: %u, PHY: %u",
+             stats.wifi_stats.wifi_rssi, stats.wifi_stats.wifi_channel, stats.wifi_stats.wifi_phy_mode);
+    
+    // Log top CPU consumers
+    ESP_LOGI(TAG, "Top CPU Consumers:");
+    for (uint32_t i = 0; i < stats.cpu_stats_count && i < 5; i++) {
+        if (stats.cpu_stats[i].cpu_usage_percent > 0) {
+            ESP_LOGI(TAG, "  %s: %u%% (Freq: %u Hz, Avg: %u ms)",
+                     stats.cpu_stats[i].task_name,
+                     stats.cpu_stats[i].cpu_usage_percent,
+                     stats.cpu_stats[i].frequency_hz,
+                     stats.cpu_stats[i].avg_runtime_ms);
+        }
+    }
 } 

@@ -366,6 +366,11 @@ static void D_DoomLoop(void)
           P_Checksum(gametic);
           gametic++;
           maketic++;
+          
+          // Reset watchdog after processing single tic
+          if (esp_task_wdt_status(NULL) == ESP_OK) {
+            esp_task_wdt_reset();
+          }
         }
       else
         TryRunTics (); // will run at least one tic

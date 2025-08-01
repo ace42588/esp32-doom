@@ -50,12 +50,14 @@
 #include "w_wad.h"
 #include "st_stuff.h"
 #include "lprintf.h"
+#include "gamepad.h"
 
 #include "esp_task.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "frame_queue.h"
+#include "instrumentation_interface.h"
 
 int use_doublebuffer = 0;
 int use_fullscreen = 0;
@@ -97,7 +99,7 @@ void I_UpdateNoBlit (void)
  */
 void I_StartFrame (void)
 {
-
+  gamepadPoll();
 }
 
 
@@ -117,14 +119,18 @@ void I_EndDisplay(void)
 void I_FinishUpdate (void)
 {
   uint8_t *scr=(uint8_t*)screens[0].data;
+  // Copy screen buffer to frame queue
   uint8_t *buf = frame_queue_get_write_buffer(&g_frame_queue);
   if (!buf) {
-    // Queue is full — drop frame
     return;
   }
 
   buf[0] = current_palette;
   memcpy(buf+1, scr, SCREENWIDTH*SCREENHEIGHT);
+  
+  // Track PSRAM write operation for video frame
+  instrumentation_psram_write_operation(SCREENWIDTH*SCREENHEIGHT);
+  
   frame_queue_submit_frame(&g_frame_queue);
 }
 
@@ -151,6 +157,9 @@ void I_PreInitGraphics(void)
   }
   screenbuf = heap_caps_malloc(SCREENWIDTH*SCREENHEIGHT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   assert(screenbuf);
+  if (screenbuf) {
+    instrumentation_psram_write_operation(SCREENWIDTH*SCREENHEIGHT);
+  }
   lprintf(LO_INFO, "I_PreInitGraphics: Frame queue is ready\n");
 }
 
@@ -196,6 +205,7 @@ void I_InitGraphics(void)
 
     /* Set the video mode */
     I_UpdateVideoMode();
+
   }
 }
 

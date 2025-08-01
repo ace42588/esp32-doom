@@ -69,6 +69,7 @@
 #include "m_argv.h"
 #include "r_fps.h"
 #include "lprintf.h"
+#include "esp_task_wdt.h"
 
 static boolean   server;
 static int       remotetic; // Tic expected from the remote
@@ -461,9 +462,17 @@ void TryRunTics (void)
 {
   int runtics;
   int entertime = I_GetTime();
+  int loop_count = 0; // Counter to track loop iterations
 
   // Wait for tics to run
   while (1) {
+    // Reset watchdog every 1000 iterations to prevent timeouts
+    if (++loop_count % 1000 == 0) {
+      if (esp_task_wdt_status(NULL) == ESP_OK) {
+        esp_task_wdt_reset();
+      }
+    }
+    
 #ifdef HAVE_NET
     NetUpdate();
 #else
@@ -507,6 +516,11 @@ void TryRunTics (void)
   }
 
   while (runtics--) {
+    // Reset watchdog before processing each tic to prevent timeouts
+    if (esp_task_wdt_status(NULL) == ESP_OK) {
+      esp_task_wdt_reset();
+    }
+    
 #ifdef HAVE_NET
     if (server) CheckQueuedPackets();
 #endif

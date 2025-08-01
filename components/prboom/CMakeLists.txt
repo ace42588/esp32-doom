@@ -70,6 +70,7 @@ w_wad.c
 wi_stuff.c
 z_bmalloc.c
 z_zone.c
+joystick_vars.c
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/select.h>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <netinet/in.h>
@@ -12,14 +13,69 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/sha1.h>
 #include "websocket_server.h"
 #include "frame_queue.h"
 #include "ws_deflate.h"
-#include "miniz.h"
+#include "full_miniz.h"
+#include "input_handler.h"
+#include "instrumentation_interface.h"
+#include "esp_timer.h"
 
 #define TAG "ws_server"
+
+// WebSocket profiling structures
+typedef struct {
+    uint32_t total_operations;
+    uint32_t total_time_us;
+    uint32_t min_time_us;
+    uint32_t max_time_us;
+    uint32_t avg_time_us;
+    uint32_t last_operation_time;
+} websocket_profile_stats_t;
+
+// Global profiling stats
+static websocket_profile_stats_t handshake_stats = {0};
+static websocket_profile_stats_t compression_stats = {0};
+static websocket_profile_stats_t frame_send_stats = {0};
+static websocket_profile_stats_t frame_recv_stats = {0};
+static websocket_profile_stats_t deflate_stats = {0};
+
+// Profiling helper functions
+static void update_profile_stats(websocket_profile_stats_t *stats, uint32_t operation_time_us) {
+    stats->total_operations++;
+    stats->total_time_us += operation_time_us;
+    stats->last_operation_time = operation_time_us;
+    
+    if (operation_time_us < stats->min_time_us || stats->min_time_us == 0) {
+        stats->min_time_us = operation_time_us;
+    }
+    if (operation_time_us > stats->max_time_us) {
+        stats->max_time_us = operation_time_us;
+    }
+    
+    stats->avg_time_us = stats->total_time_us / stats->total_operations;
+}
+
+static void log_profile_stats(const char *operation, websocket_profile_stats_t *stats) {
+    if (stats->total_operations > 0) {
+        ESP_LOGI(TAG, "WebSocket %s Profile: ops=%u, avg=%uus, min=%uus, max=%uus, total=%uus",
+                 operation, stats->total_operations, stats->avg_time_us, 
+                 stats->min_time_us, stats->max_time_us, stats->total_time_us);
+    }
+}
+
+void log_all_websocket_profiles(void) {
+    ESP_LOGI(TAG, "=== WEBSOCKET PROFILING REPORT ===");
+    log_profile_stats("Handshake", &handshake_stats);
+    log_profile_stats("Compression", &compression_stats);
+    log_profile_stats("Frame Send", &frame_send_stats);
+    log_profile_stats("Frame Receive", &frame_recv_stats);
+    log_profile_stats("Deflate", &deflate_stats);
+    ESP_LOGI(TAG, "=== END WEBSOCKET PROFILING ===");
+}
 
 // WebSocket magic string for handshake
 const char *WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -83,22 +139,46 @@ static int parse_ws_frame_header(const uint8_t *data, size_t len,
     return 0;
 }
 
-// Non-blocking send with timeout
+// Non-blocking send with timeout using select()
 static int nonblocking_send(int sockfd, const void *buf, size_t len, int timeout_ms) {
     size_t total_sent = 0;
     TickType_t start_time = xTaskGetTickCount();
     
     while (total_sent < len) {
+        // Use select() to check if socket is writable
+        fd_set write_fds;
+        struct timeval timeout;
+        
+        FD_ZERO(&write_fds);
+        FD_SET(sockfd, &write_fds);
+        
+        // Calculate remaining timeout
+        uint32_t elapsed_ms = (xTaskGetTickCount() - start_time) * portTICK_PERIOD_MS;
+        if (elapsed_ms >= timeout_ms) {
+            ESP_LOGE(TAG, "Send timeout after %d ms", timeout_ms);
+            return -1;
+        }
+        
+        uint32_t remaining_ms = timeout_ms - elapsed_ms;
+        timeout.tv_sec = remaining_ms / 1000;
+        timeout.tv_usec = (remaining_ms % 1000) * 1000;
+        
+        int select_result = select(sockfd + 1, NULL, &write_fds, NULL, &timeout);
+        
+        if (select_result < 0) {
+            ESP_LOGE(TAG, "Select error: errno=%d", errno);
+            return -1;
+        } else if (select_result == 0) {
+            ESP_LOGE(TAG, "Send timeout after %d ms", timeout_ms);
+            return -1;
+        }
+        
+        // Socket is writable, try to send
         ssize_t sent = send(sockfd, (const char*)buf + total_sent, len - total_sent, MSG_DONTWAIT);
         
         if (sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Socket buffer full, check timeout
-                if ((xTaskGetTickCount() - start_time) * portTICK_PERIOD_MS > timeout_ms) {
-                    ESP_LOGE(TAG, "Send timeout after %d ms", timeout_ms);
-                    return -1;
-                }
-                vTaskDelay(pdMS_TO_TICKS(1));
+                // This shouldn't happen after select() says it's writable, but handle it
                 continue;
             } else {
                 ESP_LOGE(TAG, "Send error: errno=%d", errno);
@@ -113,40 +193,66 @@ static int nonblocking_send(int sockfd, const void *buf, size_t len, int timeout
         total_sent += sent;
     }
     
+    // Track network throughput for successful sends
+    if (total_sent > 0) {
+        instrumentation_network_sent_bytes(total_sent);
+        instrumentation_network_sent_packet();
+    }
+    
     return total_sent;
 }
 
-// Non-blocking recv with timeout
+// Non-blocking recv with timeout using select()
 static int nonblocking_recv(int sockfd, void *buf, size_t len, int timeout_ms) {
-    TickType_t start_time = xTaskGetTickCount();
+    // Use select() to check if socket has data to read
+    fd_set read_fds;
+    struct timeval timeout;
     
-    while (1) {
-        ssize_t received = recv(sockfd, buf, len, MSG_DONTWAIT);
-        
-        if (received < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No data available, check timeout
-                if ((xTaskGetTickCount() - start_time) * portTICK_PERIOD_MS > timeout_ms) {
-                    return 0; // Timeout, no data available
-                }
-                vTaskDelay(pdMS_TO_TICKS(1));
-                continue;
-            } else {
-                ESP_LOGE(TAG, "Recv error: errno=%d", errno);
-                return -1;
-            }
-        } else if (received == 0) {
-            // Connection closed
-            ESP_LOGI(TAG, "Connection closed by peer");
+    FD_ZERO(&read_fds);
+    FD_SET(sockfd, &read_fds);
+    
+    timeout.tv_sec = timeout_ms / 1000;
+    timeout.tv_usec = (timeout_ms % 1000) * 1000;
+    
+    int select_result = select(sockfd + 1, &read_fds, NULL, NULL, &timeout);
+    
+    if (select_result < 0) {
+        ESP_LOGE(TAG, "Select error: errno=%d", errno);
+        return -1;
+    } else if (select_result == 0) {
+        return 0; // Timeout, no data available
+    }
+    
+    // Socket has data to read
+    ssize_t received = recv(sockfd, buf, len, MSG_DONTWAIT);
+    
+    if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // This shouldn't happen after select() says it's readable, but handle it
+            return 0;
+        } else {
+            ESP_LOGE(TAG, "Recv error: errno=%d", errno);
             return -1;
         }
-        
-        return received;
+    } else if (received == 0) {
+        // Connection closed
+        ESP_LOGI(TAG, "Connection closed by peer");
+        return -1;
     }
+    
+    // Track network throughput for successful receives
+    if (received > 0) {
+        instrumentation_network_received_bytes(received);
+        instrumentation_network_received_packet();
+    }
+    
+    return received;
 }
 
 // Handle WebSocket handshake with non-blocking operations
 static int websocket_handshake(int client_fd) {
+    uint64_t start_time = esp_timer_get_time();
+    
     // Use PSRAM for handshake buffer to save internal memory
     char *buffer = heap_caps_malloc(MAX_HEADER, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buffer == NULL) {
@@ -181,20 +287,18 @@ static int websocket_handshake(int client_fd) {
         heap_caps_free(buffer);
         return -1;
     }
-
+    
     key_ptr += strlen(key_hdr);
-    char *eol = strstr(key_ptr, "\r\n");
-    if (!eol) {
+    char *key_end = strstr(key_ptr, "\r\n");
+    if (!key_end) {
         heap_caps_free(buffer);
         return -1;
     }
-
-    char client_key[128] = {0};
-    strncpy(client_key, key_ptr, eol - key_ptr);
-
-    char accept_key[128];
-    base64_sha1(client_key, accept_key, sizeof(accept_key));
-
+    *key_end = 0;
+    
+    char accept_key[64];
+    base64_sha1(key_ptr, accept_key, sizeof(accept_key));
+    
     // Parse extensions for permessage-deflate support
     char extensions_response[256] = "";
     const char *extensions_hdr = "Sec-WebSocket-Extensions: ";
@@ -222,7 +326,7 @@ static int websocket_handshake(int client_fd) {
                  "Upgrade: websocket\r\n"
                  "Connection: Upgrade\r\n"
                  "Sec-WebSocket-Accept: %s\r\n"
-                 "Sec-WebSocket-Extensions: %s\r\n\r\n", 
+                 "Sec-WebSocket-Extensions: %s\r\n\r\n",
                  accept_key, extensions_response);
     } else {
         snprintf(response, sizeof(response),
@@ -233,11 +337,21 @@ static int websocket_handshake(int client_fd) {
     }
 
     heap_caps_free(buffer);
-    return nonblocking_send(client_fd, response, strlen(response), 5000);
+    
+    int result = nonblocking_send(client_fd, response, strlen(response), 5000);
+    
+    // Update profiling stats
+    uint64_t end_time = esp_timer_get_time();
+    uint32_t operation_time_us = (uint32_t)(end_time - start_time);
+    update_profile_stats(&handshake_stats, operation_time_us);
+    
+    return result;
 }
 
 // Send WebSocket binary frame with non-blocking operations
 int websocket_send_binary_frame(int client_fd, const uint8_t *data, size_t len) {
+    uint64_t start_time = esp_timer_get_time();
+    
     // Find the client structure
     websocket_client_t *client = NULL;
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
@@ -254,35 +368,11 @@ int websocket_send_binary_frame(int client_fd, const uint8_t *data, size_t len) 
     
     const uint8_t *frame_data = data;
     size_t frame_len = len;
-    uint8_t *compressed_data = NULL;
     
-#if WS_ENABLE_PERMESSAGE_DEFLATE
-    // Compress data if compression is enabled
-    if (client->compression_enabled) {
-        compressed_data = heap_caps_malloc(WS_DEFLATE_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (compressed_data) {
-            size_t compressed_len = WS_DEFLATE_BUFFER_SIZE;
-            if (websocket_compress_frame(client, data, len, compressed_data, &compressed_len) == 0) {
-                // Use compressed data if it's smaller
-                if (compressed_len < len) {
-                    frame_data = compressed_data;
-                    frame_len = compressed_len;
-                    ESP_LOGI(TAG, "Using compressed frame: %zu -> %zu bytes", len, compressed_len);
-                } else {
-                    ESP_LOGI(TAG, "Compression not beneficial, using original frame");
-                    heap_caps_free(compressed_data);
-                    compressed_data = NULL;
-                }
-            } else {
-                ESP_LOGW(TAG, "Compression failed, using original frame");
-                heap_caps_free(compressed_data);
-                compressed_data = NULL;
-            }
-        }
-    }
-#endif
+    // Track PSRAM read operation for frame data
+    instrumentation_psram_read_operation(len);
     
-    const size_t max_chunk_size = 16384; // 16KB per fragment
+    const size_t max_chunk_size = WS_MAX_FRAME_CHUNK_SIZE; // Smaller chunks for better reliability
     size_t offset = 0;
     int fragment_count = 0;
     
@@ -296,10 +386,8 @@ int websocket_send_binary_frame(int client_fd, const uint8_t *data, size_t len) 
         size_t header_len = 0;
         
         // Set FIN bit only on last fragment, opcode only on first fragment
-        // Also set RSV1 bit (0x40) if this is compressed data
-        uint8_t rsv1_bit = (compressed_data && fragment_count == 0) ? 0x40 : 0x00;
         if (fragment_count == 0) {
-            header[0] = (is_last ? 0x82 : 0x02) | rsv1_bit; // First fragment: binary frame, FIN only if last
+            header[0] = (is_last ? 0x82 : 0x02); // First fragment: binary frame, FIN only if last
         } else {
             header[0] = is_last ? 0x80 : 0x00; // Continuation frame: no opcode, FIN only if last
         }
@@ -323,40 +411,25 @@ int websocket_send_binary_frame(int client_fd, const uint8_t *data, size_t len) 
         //ESP_LOGI(TAG, "Sending fragment %d: offset=%zu, size=%zu, is_last=%d", 
         //         fragment_count, offset, chunk_size, is_last);
         
-        // Send header with non-blocking operation
-        if (nonblocking_send(client_fd, header, header_len, 1000) < 0) {
-            ESP_LOGE(TAG, "Failed to send WebSocket fragment header");
-            if (compressed_data) {
-                heap_caps_free(compressed_data);
-            }
+        if (nonblocking_send(client_fd, header, header_len, WS_SEND_TIMEOUT_MS) < 0) {
+            ESP_LOGE(TAG, "Failed to send frame header");
             return -1;
         }
         
-        // Send fragment data with non-blocking operation
-        if (nonblocking_send(client_fd, frame_data + offset, chunk_size, 1000) < 0) {
-            ESP_LOGE(TAG, "Failed to send WebSocket fragment data");
-            if (compressed_data) {
-                heap_caps_free(compressed_data);
-            }
+        if (nonblocking_send(client_fd, frame_data + offset, chunk_size, WS_SEND_TIMEOUT_MS) < 0) {
+            ESP_LOGE(TAG, "Failed to send frame data");
             return -1;
         }
         
         offset += chunk_size;
         fragment_count++;
-        
-        // Small delay between chunks to allow lwIP to process
-        if (offset < frame_len) {
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
     }
     
-    // Clean up compressed data
-    if (compressed_data) {
-        heap_caps_free(compressed_data);
-    }
+    // Update frame send profiling stats
+    uint64_t end_time = esp_timer_get_time();
+    uint32_t operation_time_us = (uint32_t)(end_time - start_time);
+    update_profile_stats(&frame_send_stats, operation_time_us);
     
-    //ESP_LOGI(TAG, "WebSocket fragmentation complete: %d fragments sent, total=%zu bytes", 
-    //         fragment_count, len);
     return 0;
 }
 
@@ -385,12 +458,12 @@ int websocket_send_text_frame(int client_fd, const char *text) {
 
     //ESP_LOGI(TAG, "Sending WebSocket text frame: size=%zu", len);
     
-    if (nonblocking_send(client_fd, header, header_len, 1000) < 0) {
+    if (nonblocking_send(client_fd, header, header_len, WS_SEND_TIMEOUT_MS) < 0) {
         ESP_LOGE(TAG, "Failed to send text frame header");
         return -1;
     }
     
-    if (nonblocking_send(client_fd, text, len, 1000) < 0) {
+    if (nonblocking_send(client_fd, text, len, WS_SEND_TIMEOUT_MS) < 0) {
         ESP_LOGE(TAG, "Failed to send text frame data");
         return -1;
     }
@@ -402,7 +475,7 @@ int websocket_send_text_frame(int client_fd, const char *text) {
 // Send WebSocket ping frame with non-blocking operations
 int websocket_send_ping(int client_fd) {
     uint8_t header[2] = {0x89, 0x00}; // FIN + ping frame, no payload
-    if (nonblocking_send(client_fd, header, 2, 1000) < 0) {
+    if (nonblocking_send(client_fd, header, 2, WS_SEND_TIMEOUT_MS) < 0) {
         ESP_LOGE(TAG, "Failed to send ping frame");
         return -1;
     }
@@ -462,7 +535,11 @@ int websocket_parse_deflate_extension(const char *extensions, char *response, si
 // Custom allocation functions for miniz
 static void *miniz_alloc_func(void *opaque, size_t items, size_t size) {
     (void)opaque;
-    return heap_caps_malloc(items * size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *ptr = heap_caps_malloc(items * size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ptr) {
+        instrumentation_psram_write_operation(items * size);
+    }
+    return ptr;
 }
 
 static void miniz_free_func(void *opaque, void *address) {
@@ -586,9 +663,14 @@ void websocket_cleanup_compression(websocket_client_t *client) {
 // Compress a frame using deflate
 int websocket_compress_frame(websocket_client_t *client, const uint8_t *input, size_t input_len, 
                            uint8_t *output, size_t *output_len) {
+    uint64_t start_time = esp_timer_get_time();
+    
     if (!client || !client->compression_enabled || !client->deflate_buffer || !client->deflate_stream) {
         return -1;
     }
+    
+    // Track PSRAM read operation for input data
+    instrumentation_psram_read_operation(input_len);
     
     // Use the ws_deflate implementation which properly handles RFC 7692
     size_t compressed_len = *output_len;
@@ -597,9 +679,18 @@ int websocket_compress_frame(websocket_client_t *client, const uint8_t *input, s
     if (result == 0) {
         // Only use compression if it actually reduces the size
         if (compressed_len < input_len) {
+            // Track PSRAM write operation for compressed data
+            instrumentation_psram_write_operation(compressed_len);
+            
             memcpy(output, client->deflate_buffer, compressed_len);
             *output_len = compressed_len;
             ESP_LOGI(TAG, "Compressed frame: %zu -> %zu bytes (RFC 7692 compliant)", input_len, *output_len);
+            
+            // Update deflate profiling stats
+            uint64_t end_time = esp_timer_get_time();
+            uint32_t operation_time_us = (uint32_t)(end_time - start_time);
+            update_profile_stats(&deflate_stats, operation_time_us);
+            
             return 0;
         } else {
             ESP_LOGW(TAG, "Compression not beneficial: %zu -> %zu bytes, using original", input_len, compressed_len);
@@ -637,6 +728,8 @@ int websocket_decompress_frame(websocket_client_t *client, const uint8_t *input,
 
 // Handle incoming WebSocket frames with non-blocking operations
 static int handle_ws_frame(int client_fd) {
+    uint64_t start_time = esp_timer_get_time();
+    
     // Use PSRAM for frame buffer to save internal memory
     uint8_t *buffer = heap_caps_malloc(WS_FRAME_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buffer == NULL) {
@@ -659,6 +752,9 @@ static int handle_ws_frame(int client_fd) {
         return 0; // No data available (normal for non-blocking socket)
     }
     
+    // Track PSRAM read operation for received data
+    instrumentation_psram_read_operation(len);
+    
     uint8_t opcode, masked;
     uint64_t payload_len;
     uint8_t mask[4];
@@ -679,11 +775,48 @@ static int handle_ws_frame(int client_fd) {
             return -1;
         case WS_FRAME_TEXT:
         case WS_FRAME_BINARY:
-            // Handle payload if needed
+            // Handle input messages
+            if (payload_len > 0) {
+                // Calculate payload offset based on frame header size
+                size_t header_size = 2; // Basic header size
+                if (payload_len >= 126 && payload_len < 65536) {
+                    header_size += 2; // Extended payload length
+                } else if (payload_len >= 65536) {
+                    header_size += 8; // Extended payload length (64-bit)
+                }
+                if (masked) {
+                    header_size += 4; // Mask
+                }
+                
+                if (len >= header_size + payload_len) {
+                    // Process the payload
+                    uint8_t *payload = buffer + header_size;
+                    
+                    // Demask if necessary
+                    if (masked) {
+                        for (size_t i = 0; i < payload_len; i++) {
+                            payload[i] ^= mask[i % 4];
+                        }
+                    }
+                    
+                    // Handle the input (could be game controls, etc.)
+                    // For now, just log the received data
+                    ESP_LOGI(TAG, "Received WebSocket frame: opcode=%d, payload_len=%llu", opcode, payload_len);
+                }
+            }
+            break;
+        default:
+            ESP_LOGW(TAG, "Unhandled WebSocket opcode: %d", opcode);
             break;
     }
     
     heap_caps_free(buffer);
+    
+    // Update frame receive profiling stats
+    uint64_t end_time = esp_timer_get_time();
+    uint32_t operation_time_us = (uint32_t)(end_time - start_time);
+    update_profile_stats(&frame_recv_stats, operation_time_us);
+    
     return 0;
 }
 
@@ -700,6 +833,10 @@ void websocket_server_init(websocket_server_t *server) {
         server->clients[i].deflate_buffer_size = 0;
         server->clients[i].inflate_buffer_size = 0;
     }
+
+    // Initialize input handler
+    ESP_LOGI(TAG, "Initializing input handler...");
+    ESP_ERROR_CHECK(input_handler_init());
 }
 
 // Start WebSocket server
@@ -816,16 +953,6 @@ void websocket_server_task(void *pv) {
                     server->clients[i].fd = client_fd;
                     server->clients[i].active = 1;
                     server->client_count++;
-                    
-#if WS_ENABLE_PERMESSAGE_DEFLATE
-                    // Initialize compression if supported
-                    if (websocket_init_compression(&server->clients[i]) == 0) {
-                        ESP_LOGI(TAG, "Compression initialized for client %d", i);
-                    } else {
-                        ESP_LOGW(TAG, "Failed to initialize compression for client %d", i);
-                    }
-#endif
-                    
                     break;
                 }
             }
@@ -842,11 +969,6 @@ void websocket_server_task(void *pv) {
                 int result = handle_ws_frame(server->clients[i].fd);
                 if (result < 0) {
                     ESP_LOGI(TAG, "Client disconnected (frame handling failed)");
-                    
-#if WS_ENABLE_PERMESSAGE_DEFLATE
-                    // Cleanup compression
-                    websocket_cleanup_compression(&server->clients[i]);
-#endif
                     
                     close(server->clients[i].fd);
                     server->clients[i].fd = -1;
@@ -869,11 +991,6 @@ void websocket_server_task(void *pv) {
                     if (websocket_send_binary_frame(server->clients[i].fd, frame, FRAME_SIZE + 1) < 0) {
                         ESP_LOGW(TAG, "Failed to send frame to client %d", i);
                         
-#if WS_ENABLE_PERMESSAGE_DEFLATE
-                        // Cleanup compression
-                        websocket_cleanup_compression(&server->clients[i]);
-#endif
-                        
                         close(server->clients[i].fd);
                         server->clients[i].fd = -1;
                         server->clients[i].active = 0;
@@ -884,9 +1001,6 @@ void websocket_server_task(void *pv) {
                 }
             }
             frame_queue_release_frame(&g_frame_queue);
-            
-            // Small delay between frames to allow client to process
-            vTaskDelay(pdMS_TO_TICKS(10));
         }
 
         // Send ping to keep connection alive

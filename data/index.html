@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>ESP32 Doom Framebuffer Viewer</title>
+  <title>ESP32 Doom</title>
   <style>
     body { background: #111; color: #eee; text-align: center; }
     canvas { background: #000; margin-top: 20px; }
@@ -18,6 +18,13 @@
     const HEIGHT = 240;
     const BYTES_PER_PIXEL = 1; // 8bpp indexed color
     const EXPECTED_FRAME_SIZE = WIDTH * HEIGHT * BYTES_PER_PIXEL + 1; // +1 for palette index
+    
+    // Input handling constants
+    const WS_MSG_INPUT_KEYDOWN = 0x01;
+    const WS_MSG_INPUT_KEYUP = 0x02;
+    const WS_MSG_INPUT_MOUSE_MOVE = 0x03;
+    const WS_MSG_INPUT_MOUSE_BTN = 0x04;
+    const WS_MSG_INPUT_JOYSTICK = 0x05;
     
     const canvas = document.getElementById('fb');
     const ctx = canvas.getContext('2d');
@@ -88,6 +95,87 @@
     ws.onclose = () => {
       console.log('WebSocket closed');
     };
+    
+    // Input handling functions
+    function sendInputMessage(type, data1, data2, data3) {
+      if (ws.readyState === WebSocket.OPEN) {
+        const message = new Uint8Array([type, data1, data2, data3]);
+        ws.send(message);
+      }
+    }
+    
+    // Keyboard input handling
+    const keyState = new Set();
+    
+    document.addEventListener('keydown', (event) => {
+      if (!keyState.has(event.code)) {
+        keyState.add(event.code);
+        sendInputMessage(WS_MSG_INPUT_KEYDOWN, event.keyCode, 0, 0);
+        console.log('Key down:', event.code, event.keyCode);
+      }
+      event.preventDefault();
+    });
+    
+    document.addEventListener('keyup', (event) => {
+      keyState.delete(event.code);
+      sendInputMessage(WS_MSG_INPUT_KEYUP, event.keyCode, 0, 0);
+      console.log('Key up:', event.code, event.keyCode);
+      event.preventDefault();
+    });
+    
+    // Mouse input handling
+    let mouseButtons = 0;
+    let lastMouseX = 0;
+    let lastMouseY = 0;
+    
+    canvas.addEventListener('mousedown', (event) => {
+      const button = event.button;
+      mouseButtons |= (1 << button);
+      sendInputMessage(WS_MSG_INPUT_MOUSE_BTN, mouseButtons, 0, 0);
+      console.log('Mouse down:', button, 'buttons:', mouseButtons);
+      event.preventDefault();
+    });
+    
+    canvas.addEventListener('mouseup', (event) => {
+      const button = event.button;
+      mouseButtons &= ~(1 << button);
+      sendInputMessage(WS_MSG_INPUT_MOUSE_BTN, mouseButtons, 0, 0);
+      console.log('Mouse up:', button, 'buttons:', mouseButtons);
+      event.preventDefault();
+    });
+    
+    canvas.addEventListener('mousemove', (event) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      
+      // Calculate relative movement
+      const deltaX = x - lastMouseX;
+      const deltaY = y - lastMouseY;
+      
+      if (Math.abs(deltaX) > 0 || Math.abs(deltaY) > 0) {
+        sendInputMessage(WS_MSG_INPUT_MOUSE_MOVE, 0, deltaX, deltaY);
+        console.log('Mouse move:', deltaX, deltaY);
+      }
+      
+      lastMouseX = x;
+      lastMouseY = y;
+      event.preventDefault();
+    });
+    
+    // Prevent context menu on right-click
+    canvas.addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+    });
+    
+    // Focus the canvas to capture keyboard input
+    canvas.focus();
+    canvas.setAttribute('tabindex', '0');
+    
+    // Keep focus on canvas
+    document.addEventListener('click', () => {
+      canvas.focus();
+    });
   </script>
 </body>
 </html>

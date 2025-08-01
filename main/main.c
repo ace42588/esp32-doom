@@ -29,7 +29,7 @@
 
 #define DOOM_TASK_CORE 1         // Core 0 = WiFi, Core 1 = Doom
 #define DOOM_TASK_STACK_SIZE 32768  // 32KB is the absolute minimum
-#define DOOM_TASK_PRIORITY 4
+#define DOOM_TASK_PRIORITY 8
 
 #define SERVER_TASK_CORE 0
 #define SERVER_TASK_STACK_SIZE 8192
@@ -37,7 +37,7 @@
 
 #define WEBSOCKET_TASK_CORE 0
 #define WEBSOCKET_TASK_STACK_SIZE 8192
-#define WEBSOCKET_TASK_PRIORITY 3
+#define WEBSOCKET_TASK_PRIORITY 4
 
 static const char *TAG = "Main Application";
 

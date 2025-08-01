@@ -1,4 +1,4 @@
-#include "miniz.h"
+#include "full_miniz.h"
 #include "esp_log.h"
 #include <string.h>
 #include <stdbool.h>
@@ -67,8 +67,13 @@ int ws_deflate_decompress(
     if (stream_ctx) {
         // Use existing stream context
         stream = stream_ctx;
-        // Reset the stream for new data
-        mz_inflateReset(stream);
+        // Reinitialize the stream for new data since mz_inflateReset is not available in esp_full_miniz
+        mz_inflateEnd(stream);
+        init_result = mz_inflateInit2(stream, -15);
+        if (init_result != MZ_OK) {
+            ESP_LOGE(TAG, "Inflate reinit failed: %d", init_result);
+            return -1;
+        }
     } else {
         // Create a temporary stream for one-time use
         memset(&temp_stream, 0, sizeof(temp_stream));
